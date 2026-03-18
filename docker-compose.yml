@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  aurascript:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aurascript-dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - aurascript/.env
+    environment:
+      - ENVIRONMENT=development
+      - LOG_FORMAT=console
+      - LOG_LEVEL=DEBUG
+      # Temp directories are inside the container; bind-mount for easy inspection
+      - UPLOAD_DIR=/tmp/aurascript/uploads
+      - CHUNKS_DIR=/tmp/aurascript/chunks
+    volumes:
+      # Mount source code for hot-reload in development
+      - ./aurascript:/app/aurascript:ro
+      # Mount service account key (set path in .env)
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-./service-account.json}:/secrets/service-account.json:ro
+      # Persist temp files across container restarts during dev
+      - aurascript_tmp:/tmp/aurascript
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    command: >
+      uvicorn aurascript.main:app
+      --host 0.0.0.0
+      --port 8080
+      --workers 1
+      --reload
+      --reload-dir /app/aurascript
+      --log-config logging.json
+
+volumes:
+  aurascript_tmp:

@@ -1,0 +1,36 @@
+version: "3.9"
+
+# Production overrides — apply with:
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  aurascript:
+    restart: always
+    environment:
+      - ENVIRONMENT=production
+      - LOG_FORMAT=json
+      - LOG_LEVEL=INFO
+    # Remove the source-code volume mount (no hot-reload in production)
+    volumes:
+      - /opt/aurascript/secrets/service-account.json:/secrets/service-account.json:ro
+      - aurascript_tmp:/tmp/aurascript
+    # Production command: no --reload, multiple workers not used (asyncio app)
+    command: >
+      uvicorn aurascript.main:app
+      --host 0.0.0.0
+      --port 8080
+      --workers 1
+      --loop uvloop
+      --http httptools
+      --log-config logging.json
+    # Limit container resources to protect the Linode VPS
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.5"
+        reservations:
+          memory: 512M
+
+volumes:
+  aurascript_tmp:
