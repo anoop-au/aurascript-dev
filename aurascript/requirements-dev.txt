@@ -1,0 +1,16 @@
+# AuraScript — Development and test dependencies
+# Install with: pip install -r requirements-dev.txt
+# (assumes requirements.txt is already installed)
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+anyio[trio]==4.7.0          # Backend for pytest-asyncio
+
+# ── Linting / formatting ──────────────────────────────────────────────────────
+ruff==0.8.4
+mypy==1.13.0
+
+# ── Type stubs ────────────────────────────────────────────────────────────────
+types-aiofiles==24.1.0.20241221
