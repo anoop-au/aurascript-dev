@@ -21,6 +21,8 @@ services:
     volumes:
       # Mount source code for hot-reload in development
       - ./aurascript:/app/aurascript:ro
+      # Mount .env so pydantic-settings can read it at /app/.env
+      - ./aurascript/.env:/app/.env:ro
       # Mount service account key (set path in .env)
       - ${GOOGLE_APPLICATION_CREDENTIALS:-./service-account.json}:/secrets/service-account.json:ro
       # Persist temp files across container restarts during dev

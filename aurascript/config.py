@@ -7,11 +7,38 @@ No secrets are ever hardcoded here.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    EnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+
+def _make_comma_friendly(base_cls: type) -> type:
+    """Return a subclass of *base_cls* that falls back to the raw string when
+    JSON decoding fails, allowing field_validators to do the real parsing."""
+
+    class _CommaFriendly(base_cls):  # type: ignore[valid-type]
+        def decode_complex_value(
+            self, field_name: str, field_info: Any, value: Any
+        ) -> Any:
+            try:
+                return super().decode_complex_value(field_name, field_info, value)
+            except ValueError:
+                return value
+
+    return _CommaFriendly
+
+
+_CommaFriendlyEnvSource = _make_comma_friendly(EnvSettingsSource)
+_CommaFriendlyDotEnvSource = _make_comma_friendly(DotEnvSettingsSource)
 
 
 class Settings(BaseSettings):
@@ -30,7 +57,7 @@ class Settings(BaseSettings):
     SECONDARY_DOMAIN: str = "https://www.aurascript.store"
 
     # ── CORS ──────────────────────────────────────────────────────────
-    # Comma-separated list. Must include both aurascript domains
+    # Comma-separated list or JSON array. Must include both aurascript domains
     # AND the Lovable app origin once known.
     ALLOWED_ORIGINS: list[str] = [
         "https://www.aurascript.au",
@@ -124,19 +151,52 @@ class Settings(BaseSettings):
         case_sensitive=True,
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            _CommaFriendlyEnvSource(settings_cls),
+            _CommaFriendlyDotEnvSource(settings_cls, env_file=cls.model_config.get("env_file")),
+            file_secret_settings,
+        )
+
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
     def parse_origins(cls, v: str | list) -> list[str]:
-        """Accept a comma-separated string from the environment variable."""
+        """Accept a comma-separated string or JSON array from the environment variable."""
         if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return json.loads(v)
             return [o.strip() for o in v.split(",") if o.strip()]
+        return v
+
+    @field_validator("ALLOWED_AUDIO_MIME_TYPES", mode="before")
+    @classmethod
+    def parse_mime_types(cls, v: str | list) -> list[str]:
+        """Accept a comma-separated string or JSON array from the environment variable."""
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return json.loads(v)
+            return [m.strip() for m in v.split(",") if m.strip()]
         return v
 
     @field_validator("VALID_API_KEYS", mode="before")
     @classmethod
     def parse_api_keys(cls, v: str | set | list) -> set[str]:
-        """Accept a comma-separated string from the environment variable."""
+        """Accept a comma-separated string or JSON array from the environment variable."""
         if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("["):
+                return set(json.loads(v))
             return {k.strip() for k in v.split(",") if k.strip()}
         return set(v)
 
