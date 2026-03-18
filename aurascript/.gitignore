@@ -1,0 +1,70 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# AuraScript .gitignore
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Environment files ─────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.test
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Node / frontend tooling ───────────────────────────────────────────────────
+node_modules/
+
+# ── Temporary runtime directories ─────────────────────────────────────────────
+/tmp/
+tmp/
+
+# ── Audio files (NEVER commit audio data) ────────────────────────────────────
+*.audio
+*.mp3
+*.mp4
+*.wav
+*.ogg
+*.flac
+*.aac
+*.m4a
+*.webm
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Secrets and credentials ───────────────────────────────────────────────────
+service-account.json
+*credentials*.json
+*-credentials.json
+*.pem
+*.key
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Coverage ──────────────────────────────────────────────────────────────────
+.coverage
+htmlcov/
+coverage.xml
