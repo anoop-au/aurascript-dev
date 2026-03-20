@@ -88,15 +88,13 @@ async def process_transcription_job(
             if job:
                 complete_event = JobCompleteEvent(
                     job_id=job_id,
-                    timestamp=job.completed_at or __import__("datetime").datetime.utcnow(),
+                    timestamp=job.completed_at or __import__("datetime").datetime.now(
+                        tz=__import__("datetime").timezone.utc
+                    ),
                     sequence=0,
-                    speaker_count=len(result.speaker_map) or num_speakers,
-                    total_duration_seconds=result.metadata.get("duration_seconds", 0.0),
-                    processing_time_seconds=result.metadata.get("processing_seconds", 0.0),
-                    overall_confidence=result.metadata.get("overall_confidence", 0.0),
-                    low_confidence_sections=result.metadata.get("low_confidence_sections", 0),
-                    languages_detected=result.metadata.get("languages_detected", []),
-                    word_count=result.metadata.get("word_count", 0),
+                    transcript=result.transcript,
+                    speaker_map=result.speaker_map,
+                    metadata=result.metadata,
                 )
                 await webhook_service.deliver(webhook_url, complete_event, job_id)
 

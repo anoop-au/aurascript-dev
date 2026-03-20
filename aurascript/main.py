@@ -120,6 +120,7 @@ app = FastAPI(
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=[
+        "api.aurascript.au",        # primary API domain (config.PRIMARY_DOMAIN)
         "www.aurascript.au",
         "www.aurascript.store",
         "aurascript.au",

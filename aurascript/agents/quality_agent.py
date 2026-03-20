@@ -206,10 +206,8 @@ class QualityAgent(BaseAgent):
             self._make_event(
                 QualityCheckedEvent,
                 chunk_index=input.chunk_index,
-                final_score=output.final_score,
-                heuristic_score=output.heuristic_score,
-                ai_score=output.ai_score,
-                recommendation=recommendation,
+                score=output.final_score,
+                decision=recommendation,
                 issues=all_issues,
             )
         )

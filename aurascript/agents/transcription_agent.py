@@ -263,9 +263,6 @@ class TranscriptionAgent(BaseAgent):
                 ChunkProcessingStartedEvent,
                 chunk_index=input.chunk_index,
                 total_chunks=input.total_chunks,
-                progress_percent=round(
-                    (input.chunk_index / max(input.total_chunks, 1)) * 100, 1
-                ),
             )
         )
 
@@ -276,14 +273,8 @@ class TranscriptionAgent(BaseAgent):
             self._make_event(
                 ChunkTranscribedEvent,
                 chunk_index=input.chunk_index,
-                total_chunks=input.total_chunks,
                 preview=result.transcript[:200],
-                confidence=result.metadata.confidence,
-                detected_languages=result.metadata.detected_languages,
-                issues=result.metadata.issues,
-                start_time_seconds=float(
-                    input.chunk_index * self.settings.CHUNK_DURATION_SECONDS
-                ),
+                confidence_score=result.metadata.confidence,
             )
         )
 
@@ -333,7 +324,6 @@ class TranscriptionAgent(BaseAgent):
             temperature=0.0,        # Deterministic — critical for accuracy
             max_output_tokens=8192,
             top_p=1.0,
-            top_k=1,
         )
 
         safety_settings = {

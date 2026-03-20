@@ -40,7 +40,7 @@ class JobStatusResponse(BaseModel):
 
     job_id: str
     status: str
-    progress_percent: float
+    progress_pct: float          # matches frontend spec (was progress_percent)
     current_stage: str
     created_at: datetime
     updated_at: datetime

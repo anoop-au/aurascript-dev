@@ -52,18 +52,20 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: Annotated[int, Field(ge=1, le=65535)] = 8080
     # Primary domain. Used to construct absolute URLs in API responses.
-    PRIMARY_DOMAIN: str = "https://www.aurascript.au"
+    PRIMARY_DOMAIN: str = "https://api.aurascript.au"
     # Secondary domain. Redirects handled at Nginx level.
     SECONDARY_DOMAIN: str = "https://www.aurascript.store"
 
     # ── CORS ──────────────────────────────────────────────────────────
-    # Comma-separated list or JSON array. Must include both aurascript domains
-    # AND the Lovable app origin once known.
+    # Comma-separated list or JSON array. Includes the Lovable origin,
+    # the www frontend proxy, and local dev servers.
     ALLOWED_ORIGINS: list[str] = [
-        "https://www.aurascript.au",
+        "https://echo-scribe-02.lovable.app",  # Lovable app (canonical origin)
+        "https://www.aurascript.au",            # www frontend reverse proxy
+        "https://api.aurascript.au",            # API domain (same-origin requests)
         "https://www.aurascript.store",
-        "http://localhost:3000",         # Local Lovable dev
-        "http://localhost:5173",         # Vite dev server
+        "http://localhost:3000",                # Local Lovable dev
+        "http://localhost:5173",                # Vite dev server
     ]
 
     # ── Google Vertex AI ──────────────────────────────────────────────
@@ -102,12 +104,17 @@ class Settings(BaseSettings):
     # Whitelist of accepted MIME types validated against Content-Type header.
     ALLOWED_AUDIO_MIME_TYPES: list[str] = [
         "audio/mpeg",
+        "audio/mp3",      # browser alias for audio/mpeg
         "audio/wav",
+        "audio/x-wav",    # browser alias for audio/wav
         "audio/mp4",
+        "audio/m4a",      # browser alias for audio/x-m4a
+        "audio/x-m4a",
         "audio/ogg",
         "audio/webm",
+        "video/webm",     # webm audio recorded via MediaRecorder
         "audio/flac",
-        "audio/x-m4a",
+        "audio/x-flac",   # browser alias for audio/flac
         "audio/aac",
     ]
 
@@ -209,7 +216,7 @@ class Settings(BaseSettings):
     def websocket_base_url(self) -> str:
         """Return wss:// in production, ws:// in development/staging."""
         if self.is_production:
-            return "wss://www.aurascript.au"
+            return "wss://api.aurascript.au"
         return f"ws://localhost:{self.PORT}"
 
 

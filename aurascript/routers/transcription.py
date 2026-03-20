@@ -61,7 +61,7 @@ router = APIRouter(tags=["Transcription"])
 async def submit_transcription(
     request: Request,
     background_tasks: BackgroundTasks,
-    audio_file: UploadFile,
+    file: UploadFile,
     language_hint: str = Form("auto", max_length=50),
     num_speakers: int = Form(2, ge=1, le=10),
     webhook_url: Optional[str] = Form(None),
@@ -84,7 +84,7 @@ async def submit_transcription(
 
     try:
         # Save the upload (validates MIME + magic bytes, enforces 700MB limit).
-        audio_path = await storage.save_upload(audio_file, job_id)
+        audio_path = await storage.save_upload(file, job_id)
         await job_store.update_job(job_id, file_paths=[audio_path])
     except HTTPException:
         # Cleanup the job record on upload failure.
@@ -150,7 +150,7 @@ async def get_job_status(
     return JobStatusResponse(
         job_id=job.job_id,
         status=job.status.value,
-        progress_percent=job.progress_percent,
+        progress_pct=job.progress_percent,
         current_stage=job.current_stage,
         created_at=job.created_at,
         updated_at=job.updated_at,

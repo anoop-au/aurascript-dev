@@ -59,7 +59,7 @@ async def transcription_websocket(
     if job is None:
         await websocket.accept()
         await websocket.send_json({
-            "event_type": "JOB_FAILED",
+            "event_type": "job.failed",
             "job_id": job_id,
             "error_code": "INTERNAL_ERROR",
             "error_message": f"Job {job_id!r} not found.",
@@ -75,7 +75,7 @@ async def transcription_websocket(
     if job.status == JobStatus.COMPLETED:
         history = await event_bus.replay_history(job_id, 0)
         terminal = next(
-            (e for e in reversed(history) if e.event_type == "JOB_COMPLETE"), None
+            (e for e in reversed(history) if e.event_type == "job.complete"), None
         )
         if terminal:
             await connection_manager.broadcast_to_job(job_id, terminal)
@@ -87,7 +87,7 @@ async def transcription_websocket(
     if job.status == JobStatus.FAILED:
         history = await event_bus.replay_history(job_id, 0)
         terminal = next(
-            (e for e in reversed(history) if e.event_type == "JOB_FAILED"), None
+            (e for e in reversed(history) if e.event_type == "job.failed"), None
         )
         if terminal:
             await connection_manager.broadcast_to_job(job_id, terminal)

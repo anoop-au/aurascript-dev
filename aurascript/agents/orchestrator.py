@@ -138,7 +138,8 @@ class OrchestratorAgent(BaseAgent):
     ) -> None:
         super().__init__(job_id, event_bus, settings)
         self._current_progress: float = 0.0
-        self._active_chunks: list[int] = []
+        self._chunks_done: int = 0
+        self._total_chunks: int = 0
 
     async def run(self, input: OrchestratorInput) -> OrchestratorOutput:
         job_start = time.monotonic()
@@ -149,10 +150,9 @@ class OrchestratorAgent(BaseAgent):
             self._current_progress = 2.0
             await self.emit(self._make_event(
                 ProgressHeartbeatEvent,
-                overall_progress_percent=2.0,
-                current_stage="ANALYZING",
-                active_chunk_indexes=[],
-                elapsed_seconds=0.0,
+                progress_pct=2.0,
+                chunks_done=0,
+                total_chunks=0,
             ))
 
             analysis = await analyze_audio(input.audio_path)
@@ -163,8 +163,7 @@ class OrchestratorAgent(BaseAgent):
                 sample_rate=analysis.sample_rate,
                 channels=analysis.channels,
                 codec=analysis.codec,
-                bitrate_kbps=analysis.bitrate_kbps,
-                is_stereo=analysis.is_stereo,
+                bitrate=analysis.bitrate_kbps,
                 quality_warnings=analysis.warnings,
             ))
             await self.emit(self._make_event(
@@ -191,32 +190,25 @@ class OrchestratorAgent(BaseAgent):
 
             await self.emit(self._make_event(
                 PlanCreatedEvent,
-                estimated_chunks=estimated_chunks,
+                chunk_count=estimated_chunks,
                 strategy=strategy,
-                estimated_processing_minutes=round(estimated_minutes, 2),
-                chunk_duration_seconds=self.settings.CHUNK_DURATION_SECONDS,
+                estimated_duration_seconds=round(estimated_minutes * 60, 1),
             ))
 
             # ── STAGE 3: CHUNK ────────────────────────────────────────────────
             self._current_progress = 10.0
-            await self.emit(self._make_event(
-                ChunkingStartedEvent,
-                total_expected_chunks=estimated_chunks,
-            ))
+            await self.emit(self._make_event(ChunkingStartedEvent))
 
             chunk_paths = await chunk_audio(
                 input.audio_path, self.job_id, analysis
             )
             all_file_paths.extend(chunk_paths)
             total_chunks = len(chunk_paths)
+            self._total_chunks = total_chunks
 
             await self.emit(self._make_event(
                 ChunkingCompleteEvent,
-                actual_chunk_count=total_chunks,
-                total_audio_seconds=analysis.duration_seconds,
-                chunk_file_sizes_kb=[
-                    int(p.stat().st_size / 1024) for p in chunk_paths
-                ],
+                chunk_count=total_chunks,
             ))
 
             # ── STAGE 4: TRANSCRIBE (PARALLEL) ───────────────────────────────
@@ -227,8 +219,10 @@ class OrchestratorAgent(BaseAgent):
                 self._heartbeat_loop("TRANSCRIBING", job_start)
             )
 
-            transcription_tasks = [
-                TranscriptionAgent(self.job_id, self.event_bus, self.settings).run(
+            async def _transcribe_tracked(path: Path, i: int) -> TranscriptionOutput:
+                result = await TranscriptionAgent(
+                    self.job_id, self.event_bus, self.settings
+                ).run(
                     TranscriptionInput(
                         chunk_path=path,
                         chunk_index=i,
@@ -238,11 +232,12 @@ class OrchestratorAgent(BaseAgent):
                     ),
                     semaphore=semaphore,
                 )
-                for i, path in enumerate(chunk_paths)
-            ]
+                self._chunks_done += 1
+                return result
 
             raw_results = await asyncio.gather(
-                *transcription_tasks, return_exceptions=True
+                *[_transcribe_tracked(path, i) for i, path in enumerate(chunk_paths)],
+                return_exceptions=True,
             )
             heartbeat_task.cancel()
 
@@ -307,7 +302,6 @@ class OrchestratorAgent(BaseAgent):
                     await self.emit(self._make_event(
                         ChunkRetryEvent,
                         chunk_index=i,
-                        attempt=1,
                         reason=", ".join(quality.issues),
                     ))
 
@@ -407,10 +401,7 @@ class OrchestratorAgent(BaseAgent):
                            "unification needed. Saves API cost.",
                 ))
             else:
-                await self.emit(self._make_event(
-                    StitchingStartedEvent,
-                    total_chunks=len(corrected_transcripts),
-                ))
+                await self.emit(self._make_event(StitchingStartedEvent))
 
                 stitch_input = StitcherInput(
                     corrected_chunks=corrected_chunks,
@@ -436,13 +427,17 @@ class OrchestratorAgent(BaseAgent):
 
             await self.emit(self._make_event(
                 JobCompleteEvent,
-                speaker_count=len(speaker_map) or input.num_speakers,
-                total_duration_seconds=analysis.duration_seconds,
-                processing_time_seconds=round(processing_seconds, 2),
-                overall_confidence=round(overall_confidence, 4),
-                low_confidence_sections=len(low_confidence_indexes),
-                languages_detected=languages_detected,
-                word_count=word_count,
+                transcript=final_transcript,
+                speaker_map=speaker_map,
+                metadata={
+                    "duration_seconds": analysis.duration_seconds,
+                    "chunk_count": total_chunks,
+                    "processing_time_seconds": round(processing_seconds, 2),
+                    "overall_confidence": round(overall_confidence, 4),
+                    "languages_detected": languages_detected,
+                    "word_count": word_count,
+                    "low_confidence_sections": len(low_confidence_indexes),
+                },
             ))
 
             self.logger.info(
@@ -500,8 +495,7 @@ class OrchestratorAgent(BaseAgent):
             await asyncio.sleep(5)
             await self.emit(self._make_event(
                 ProgressHeartbeatEvent,
-                overall_progress_percent=self._current_progress,
-                current_stage=stage,
-                active_chunk_indexes=list(self._active_chunks),
-                elapsed_seconds=round(time.monotonic() - start_time, 1),
+                progress_pct=self._current_progress,
+                chunks_done=self._chunks_done,
+                total_chunks=self._total_chunks,
             ))

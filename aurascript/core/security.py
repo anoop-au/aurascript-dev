@@ -44,14 +44,16 @@ class APIKeyAuth:
     def __init__(self) -> None:
         self._header_name: str = settings.API_KEY_HEADER
 
-    async def __call__(self, request: Request) -> str:
-        raw_key = request.headers.get(self._header_name, "")
-        if not self._is_valid(raw_key):
+    async def __call__(
+        self,
+        x_api_key: str = Header("", alias=settings.API_KEY_HEADER),
+    ) -> str:
+        if not self._is_valid(x_api_key):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"error": "Unauthorized"},
             )
-        return raw_key
+        return x_api_key
 
     def _is_valid(self, candidate: str) -> bool:
         """
@@ -121,8 +123,11 @@ class RateLimiter:
                 self._buckets[api_key] = _KeyBucket()
             return self._buckets[api_key]
 
-    async def __call__(self, request: Request) -> None:
-        api_key = request.headers.get(settings.API_KEY_HEADER, "")
+    async def __call__(
+        self,
+        x_api_key: str = Header("", alias=settings.API_KEY_HEADER),
+    ) -> None:
+        api_key = x_api_key
         if not api_key:
             # Auth dependency runs first; if we're here without a key it's an
             # unusual path. Let auth handle the 401.

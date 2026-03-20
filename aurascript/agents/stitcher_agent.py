@@ -214,12 +214,7 @@ class StitcherAgent(BaseAgent):
         """
         Send all chunks to Gemini for unification and return StitcherOutput.
         """
-        await self.emit(
-            self._make_event(
-                StitchingStartedEvent,
-                total_chunks=len(input.corrected_chunks),
-            )
-        )
+        await self.emit(self._make_event(StitchingStartedEvent))
 
         input_text = _build_stitcher_input_text(input)
         system_prompt = _STITCH_SYSTEM_PROMPT_TEMPLATE.format(
@@ -238,15 +233,7 @@ class StitcherAgent(BaseAgent):
             line for line in output.transcript.splitlines() if line.strip()
         ][:5]
 
-        await self.emit(
-            self._make_event(
-                StitchingCompleteEvent,
-                speaker_map=output.speaker_map,
-                speaker_count=len(output.speaker_map),
-                transcript_preview_lines=preview_lines,
-                low_confidence_section_count=len(input.low_confidence_indexes),
-            )
-        )
+        await self.emit(self._make_event(StitchingCompleteEvent))
 
         await self.emit(
             self._make_event(

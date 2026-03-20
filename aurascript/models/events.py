@@ -40,106 +40,80 @@ class BaseEvent(BaseModel):
 
 
 class JobAcceptedEvent(BaseEvent):
-    event_type: Literal["JOB_ACCEPTED"] = "JOB_ACCEPTED"
-    file_size_bytes: int
-    file_name_safe: str
-    poll_url: str
-    # websocket_url NOT included: client is already connected
+    event_type: Literal["job.accepted"] = "job.accepted"
+    message: str
 
 
 class AudioAnalyzedEvent(BaseEvent):
-    event_type: Literal["AUDIO_ANALYZED"] = "AUDIO_ANALYZED"
+    event_type: Literal["job.audio_analyzed"] = "job.audio_analyzed"
     duration_seconds: float
     sample_rate: int
     channels: int
     codec: str
-    bitrate_kbps: Optional[int] = None     # None for VBR audio
-    is_stereo: bool
-    quality_warnings: list[str]            # Immediate warnings from ffprobe
+    bitrate: Optional[int] = None      # kbps; None for VBR audio
+    quality_warnings: list[str]
 
 
 class PlanCreatedEvent(BaseEvent):
-    event_type: Literal["PLAN_CREATED"] = "PLAN_CREATED"
-    estimated_chunks: int
+    event_type: Literal["job.plan_created"] = "job.plan_created"
+    chunk_count: int
     strategy: Literal["single_chunk", "multi_chunk", "large_file_warning"]
-    estimated_processing_minutes: float
-    chunk_duration_seconds: int
+    estimated_duration_seconds: float
 
 
 class ChunkingStartedEvent(BaseEvent):
-    event_type: Literal["CHUNKING_STARTED"] = "CHUNKING_STARTED"
-    total_expected_chunks: int
+    event_type: Literal["job.chunking_started"] = "job.chunking_started"
 
 
 class ChunkingCompleteEvent(BaseEvent):
-    event_type: Literal["CHUNKING_COMPLETE"] = "CHUNKING_COMPLETE"
-    actual_chunk_count: int
-    total_audio_seconds: float
-    chunk_file_sizes_kb: list[int]
+    event_type: Literal["job.chunking_complete"] = "job.chunking_complete"
+    chunk_count: int
 
 
 class ChunkProcessingStartedEvent(BaseEvent):
-    event_type: Literal["CHUNK_PROCESSING_STARTED"] = "CHUNK_PROCESSING_STARTED"
+    event_type: Literal["job.chunk_processing_started"] = "job.chunk_processing_started"
     chunk_index: int
     total_chunks: int
-    progress_percent: float
 
 
 class ChunkTranscribedEvent(BaseEvent):
-    event_type: Literal["CHUNK_TRANSCRIBED"] = "CHUNK_TRANSCRIBED"
+    event_type: Literal["job.chunk_transcribed"] = "job.chunk_transcribed"
     chunk_index: int
-    total_chunks: int
     preview: Annotated[str, Field(max_length=200)]
-    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    detected_languages: list[str]
-    issues: list[str]
-    start_time_seconds: float
+    confidence_score: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
 class QualityCheckedEvent(BaseEvent):
-    event_type: Literal["QUALITY_CHECKED"] = "QUALITY_CHECKED"
+    event_type: Literal["job.quality_checked"] = "job.quality_checked"
     chunk_index: int
-    final_score: Annotated[float, Field(ge=0.0, le=1.0)]
-    heuristic_score: Annotated[float, Field(ge=0.0, le=1.0)]
-    ai_score: Optional[Annotated[float, Field(ge=0.0, le=1.0)]] = None
-    recommendation: Literal["accept", "retry", "flag"]
+    score: Annotated[float, Field(ge=0.0, le=1.0)]
+    decision: Literal["accept", "retry", "flag"]
     issues: list[str]
 
 
 class ChunkRetryEvent(BaseEvent):
-    event_type: Literal["CHUNK_RETRY"] = "CHUNK_RETRY"
+    event_type: Literal["job.chunk_retry"] = "job.chunk_retry"
     chunk_index: int
-    attempt: int
     reason: str
 
 
 class StitchingStartedEvent(BaseEvent):
-    event_type: Literal["STITCHING_STARTED"] = "STITCHING_STARTED"
-    total_chunks: int
+    event_type: Literal["job.stitching_started"] = "job.stitching_started"
 
 
 class StitchingCompleteEvent(BaseEvent):
-    event_type: Literal["STITCHING_COMPLETE"] = "STITCHING_COMPLETE"
-    speaker_map: dict[str, str]
-    speaker_count: int
-    transcript_preview_lines: list[str]    # First 5 complete lines
-    low_confidence_section_count: int
+    event_type: Literal["job.stitching_complete"] = "job.stitching_complete"
 
 
 class JobCompleteEvent(BaseEvent):
-    event_type: Literal["JOB_COMPLETE"] = "JOB_COMPLETE"
-    speaker_count: int
-    total_duration_seconds: float
-    processing_time_seconds: float
-    overall_confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    low_confidence_sections: int
-    languages_detected: list[str]
-    word_count: int
-    # transcript_url NOT included: frontend constructs from known base URL
+    event_type: Literal["job.complete"] = "job.complete"
+    transcript: str
+    speaker_map: dict[str, str]
+    metadata: dict
 
 
 class JobFailedEvent(BaseEvent):
-    event_type: Literal["JOB_FAILED"] = "JOB_FAILED"
+    event_type: Literal["job.failed"] = "job.failed"
     error_code: Literal[
         "INVALID_AUDIO",
         "AUDIO_TOO_LONG",
@@ -158,26 +132,17 @@ class JobFailedEvent(BaseEvent):
 
 
 class AgentDecisionEvent(BaseEvent):
-    event_type: Literal["AGENT_DECISION"] = "AGENT_DECISION"
+    event_type: Literal["job.agent_decision"] = "job.agent_decision"
     agent: str
     decision: str
     reason: str
 
 
 class ProgressHeartbeatEvent(BaseEvent):
-    event_type: Literal["PROGRESS_HEARTBEAT"] = "PROGRESS_HEARTBEAT"
-    overall_progress_percent: float
-    current_stage: Literal[
-        "ANALYZING",
-        "PLANNING",
-        "CHUNKING",
-        "TRANSCRIBING",
-        "QUALITY_CHECKING",
-        "STITCHING",
-        "FINALIZING",
-    ]
-    active_chunk_indexes: list[int]
-    elapsed_seconds: float
+    event_type: Literal["job.progress_heartbeat"] = "job.progress_heartbeat"
+    progress_pct: float
+    chunks_done: int
+    total_chunks: int
 
 
 # Type alias used throughout the codebase for type hints and queue signatures.
