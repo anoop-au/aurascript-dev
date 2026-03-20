@@ -7,6 +7,11 @@ Security design principles:
 - Error messages never reveal whether the key format was wrong or unknown.
 - Rate-limit state is in-process only; restarting the server resets counters.
   For a production multi-process deployment, replace with Redis.
+
+FastAPI note: Request injection only works reliably in TOP-LEVEL async functions,
+NOT in class __call__ methods (FastAPI 0.115.x + Pydantic v2 limitation).
+Both classes expose an as_dependency() method that returns a proper closure
+suitable for use with Depends().
 """
 
 from __future__ import annotations
@@ -17,9 +22,9 @@ import hmac
 import logging
 import secrets
 import time
-from typing import Annotated
+from typing import Callable
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import HTTPException, Request, status
 
 from aurascript.config import settings
 
@@ -31,29 +36,22 @@ logger = logging.getLogger(__name__)
 
 class APIKeyAuth:
     """
-    FastAPI dependency that validates the API key sent in the configured
-    request header (default: X-API-Key).
+    Validates the API key sent in the configured request header.
 
-    Usage::
+    Usage (production)::
 
-        @router.post("/transcribe")
-        async def transcribe(api_key: str = Depends(api_key_auth)):
-            ...
+        api_key: str = Depends(api_key_auth)   # module-level singleton dep
+
+    Usage (tests, isolated state)::
+
+        auth = APIKeyAuth()
+        api_key: str = Depends(auth.as_dependency())
     """
 
     def __init__(self) -> None:
         self._header_name: str = settings.API_KEY_HEADER
 
-    async def __call__(self, request: Request) -> str:
-        raw_key = request.headers.get(self._header_name, "")
-        if not self._is_valid(raw_key):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"error": "Unauthorized"},
-            )
-        return raw_key
-
-    def _is_valid(self, candidate: str) -> bool:
+    def is_valid(self, candidate: str) -> bool:
         """
         Check *candidate* against every configured API key using constant-time
         comparison. Returns True as soon as one match is found.
@@ -72,9 +70,20 @@ class APIKeyAuth:
                 matched = True
         return matched
 
+    def as_dependency(self) -> Callable:
+        """Return a plain async function usable with FastAPI Depends()."""
+        auth = self
 
-# Module-level singleton — reuse across requests so rate-limit state persists.
-api_key_auth = APIKeyAuth()
+        async def _dep(request: Request) -> str:
+            raw_key = request.headers.get(auth._header_name, "")
+            if not auth.is_valid(raw_key):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={"error": "Unauthorized"},
+                )
+            return raw_key
+
+        return _dep
 
 
 # ── Rate Limiter ───────────────────────────────────────────────────────────────
@@ -101,13 +110,14 @@ class RateLimiter:
     Counters are per API key and stored in memory. Restarting the process
     resets all counters. Buckets are created lazily on first use.
 
-    Usage::
+    Usage (production)::
 
-        @router.post("/transcribe")
-        async def transcribe(
-            api_key: str = Depends(api_key_auth),
-            _: None = Depends(rate_limiter),
-        ): ...
+        _: None = Depends(rate_limiter)   # module-level singleton dep
+
+    Usage (tests, isolated state)::
+
+        limiter = RateLimiter()
+        _: None = Depends(limiter.as_dependency())
     """
 
     def __init__(self) -> None:
@@ -121,11 +131,9 @@ class RateLimiter:
                 self._buckets[api_key] = _KeyBucket()
             return self._buckets[api_key]
 
-    async def __call__(self, request: Request) -> None:
-        api_key = request.headers.get(settings.API_KEY_HEADER, "")
+    async def check(self, api_key: str) -> None:
+        """Enforce rate limits for *api_key*. Raises 429 if limit exceeded."""
         if not api_key:
-            # Auth dependency runs first; if we're here without a key it's an
-            # unusual path. Let auth handle the 401.
             return
 
         bucket = await self._get_bucket(api_key)
@@ -226,9 +234,27 @@ class RateLimiter:
             ),
         }
 
+    def as_dependency(self) -> Callable:
+        """Return a plain async function usable with FastAPI Depends()."""
+        limiter = self
 
-# Module-level singleton.
-rate_limiter = RateLimiter()
+        async def _dep(request: Request) -> None:
+            api_key = request.headers.get(settings.API_KEY_HEADER, "")
+            await limiter.check(api_key)
+
+        return _dep
+
+
+# ── Module-level singletons and dependency functions ───────────────────────────
+# FastAPI only injects Request correctly in top-level async functions, NOT inside
+# class __call__ methods. Use as_dependency() closures everywhere.
+
+_api_key_auth_instance = APIKeyAuth()
+_rate_limiter_instance = RateLimiter()
+
+# These are the actual FastAPI dependency callables used across all routers.
+api_key_auth = _api_key_auth_instance.as_dependency()
+rate_limiter = _rate_limiter_instance.as_dependency()
 
 
 # ── Webhook Signature Verification ────────────────────────────────────────────

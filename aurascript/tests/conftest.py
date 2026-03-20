@@ -51,8 +51,8 @@ def _build_test_app(auth: APIKeyAuth, limiter: RateLimiter) -> FastAPI:
 
     @app.get("/protected")
     async def protected_endpoint(
-        api_key: str = Depends(auth),
-        _rate: None = Depends(limiter),
+        api_key: str = Depends(auth.as_dependency()),
+        _rate: None = Depends(limiter.as_dependency()),
     ) -> dict:
         return {"status": "ok", "key_prefix": api_key[:8]}
 
