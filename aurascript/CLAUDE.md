@@ -44,7 +44,7 @@ job.progress_heartbeat
 5. Event types MUST be lowercase dot-notation — frontend silently drops UPPER_CASE
 6. JobCompleteEvent must include transcript, speaker_map, metadata
 7. aurascript.service systemd unit is DISABLED — app runs via Docker only
-8. Class-based FastAPI deps (`__call__`) must use `request: Request` + `request.headers.get(...)` — `Header(alias=...)` does NOT resolve correctly inside `__call__` and always returns `""`
+8. FastAPI 0.115.x + Pydantic v2: `Request` injection FAILS in class `__call__` methods entirely (treated as required query param → 422). Use `as_dependency()` closure pattern: class holds logic, method returns `async def _dep(request: Request)` closure. `Header(alias=...)` also fails in `__call__`.
 
 ## API
 - Auth header: X-API-Key
