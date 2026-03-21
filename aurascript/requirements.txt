@@ -10,8 +10,8 @@ python-multipart==0.0.12    # Required for UploadFile / form parsing
 pydantic==2.10.3
 pydantic-settings==2.6.1
 
-# ── Google Vertex AI ──────────────────────────────────────────────────────────
-google-cloud-aiplatform==1.74.0
+# ── Google Gemini API ─────────────────────────────────────────────────────────
+google-generativeai>=0.8.3
 google-auth==2.36.0
 
 # ── Async I/O ─────────────────────────────────────────────────────────────────

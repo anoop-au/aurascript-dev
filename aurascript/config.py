@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import (
@@ -68,19 +68,19 @@ class Settings(BaseSettings):
         "http://localhost:5173",                # Vite dev server
     ]
 
-    # ── Google Vertex AI ──────────────────────────────────────────────
-    # GCP project ID where Vertex AI is enabled.
-    GOOGLE_CLOUD_PROJECT: str
-    # Vertex AI region. Must support Gemini models.
-    GOOGLE_CLOUD_LOCATION: str = "us-central1"
-    # Absolute path to the GCP service account JSON key file.
-    GOOGLE_APPLICATION_CREDENTIALS: str
+    # ── Google Gemini API ─────────────────────────────────────────────
+    # API key from https://aistudio.google.com/app/apikey
+    GEMINI_API_KEY: str
     # Model used for per-chunk transcription (Phase 1 of pipeline).
     VERTEX_AI_MODEL_TRANSCRIBE: str = "gemini-2.0-flash"
     # Model used for final transcript unification (Phase 2 of pipeline).
     VERTEX_AI_MODEL_STITCH: str = "gemini-2.0-flash"
     # Model used for quality scoring and retry decisions.
     VERTEX_AI_MODEL_QUALITY: str = "gemini-2.0-flash"
+    # Legacy Vertex AI fields — kept optional for backwards-compatibility.
+    GOOGLE_CLOUD_PROJECT: Optional[str] = None
+    GOOGLE_CLOUD_LOCATION: Optional[str] = None
+    GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
 
     # ── Security ──────────────────────────────────────────────────────
     # Comma-separated API keys. Rotate without restart by updating env var.

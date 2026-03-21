@@ -19,16 +19,10 @@ from typing import Optional
 import structlog
 
 try:
-    import vertexai
-    from vertexai.generative_models import (
-        GenerationConfig,
-        GenerativeModel,
-        HarmBlockThreshold,
-        HarmCategory,
-    )
-    _VERTEX_AVAILABLE = True
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
 except ImportError:
-    _VERTEX_AVAILABLE = False
+    _GENAI_AVAILABLE = False
 
 from aurascript.agents.base_agent import BaseAgent
 from aurascript.config import Settings
@@ -199,15 +193,12 @@ class StitcherAgent(BaseAgent):
         super().__init__(job_id, event_bus, settings)
         self._model: Optional[object] = None
 
-    def _get_model(self) -> "GenerativeModel":
-        if not _VERTEX_AVAILABLE:
-            raise RuntimeError("google-cloud-aiplatform not installed.")
+    def _get_model(self) -> "genai.GenerativeModel":
+        if not _GENAI_AVAILABLE:
+            raise RuntimeError("google-generativeai not installed.")
         if self._model is None:
-            vertexai.init(
-                project=self.settings.GOOGLE_CLOUD_PROJECT,
-                location=self.settings.GOOGLE_CLOUD_LOCATION,
-            )
-            self._model = GenerativeModel(self.settings.VERTEX_AI_MODEL_STITCH)
+            genai.configure(api_key=self.settings.GEMINI_API_KEY)
+            self._model = genai.GenerativeModel(self.settings.VERTEX_AI_MODEL_STITCH)
         return self._model  # type: ignore[return-value]
 
     async def run(self, input: StitcherInput) -> StitcherOutput:
@@ -274,17 +265,17 @@ class StitcherAgent(BaseAgent):
             response = await asyncio.to_thread(
                 model.generate_content,
                 f"{system_prompt}\n\n{input_text}",
-                generation_config=GenerationConfig(
+                generation_config=genai.GenerationConfig(
                     temperature=0.0,
                     max_output_tokens=8192,
                     response_mime_type="application/json",
                 ),
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                },
+                safety_settings=[
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                ],
             )
 
             return _parse_stitch_response(response.text, fallback_transcript)

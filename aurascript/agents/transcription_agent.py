@@ -34,17 +34,10 @@ from tenacity import (
 
 try:
     import google.api_core.exceptions
-    import vertexai
-    from vertexai.generative_models import (
-        GenerationConfig,
-        GenerativeModel,
-        HarmBlockThreshold,
-        HarmCategory,
-        Part,
-    )
-    _VERTEX_AVAILABLE = True
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
 except ImportError:
-    _VERTEX_AVAILABLE = False
+    _GENAI_AVAILABLE = False
 
 from aurascript.agents.base_agent import BaseAgent
 from aurascript.config import Settings
@@ -227,18 +220,15 @@ class TranscriptionAgent(BaseAgent):
         super().__init__(job_id, event_bus, settings)
         self._model: Optional[object] = None
 
-    def _get_model(self) -> "GenerativeModel":
-        if not _VERTEX_AVAILABLE:
+    def _get_model(self) -> "genai.GenerativeModel":
+        if not _GENAI_AVAILABLE:
             raise RuntimeError(
-                "google-cloud-aiplatform is not installed. "
-                "Run: pip install google-cloud-aiplatform"
+                "google-generativeai is not installed. "
+                "Run: pip install google-generativeai"
             )
         if self._model is None:
-            vertexai.init(
-                project=self.settings.GOOGLE_CLOUD_PROJECT,
-                location=self.settings.GOOGLE_CLOUD_LOCATION,
-            )
-            self._model = GenerativeModel(
+            genai.configure(api_key=self.settings.GEMINI_API_KEY)
+            self._model = genai.GenerativeModel(
                 self.settings.VERTEX_AI_MODEL_TRANSCRIBE
             )
         return self._model  # type: ignore[return-value]
@@ -298,7 +288,7 @@ class TranscriptionAgent(BaseAgent):
                         google.api_core.exceptions.ServiceUnavailable,
                         google.api_core.exceptions.DeadlineExceeded,
                     )
-                    if _VERTEX_AVAILABLE
+                    if _GENAI_AVAILABLE
                     else ()
                 ),
             )
@@ -318,20 +308,20 @@ class TranscriptionAgent(BaseAgent):
 
         # Read audio bytes from disk.
         audio_bytes = input.chunk_path.read_bytes()
-        audio_part = Part.from_data(data=audio_bytes, mime_type="audio/mpeg")
+        audio_part = {"mime_type": "audio/mpeg", "data": audio_bytes}
 
-        generation_config = GenerationConfig(
+        generation_config = genai.GenerationConfig(
             temperature=0.0,        # Deterministic — critical for accuracy
             max_output_tokens=8192,
             top_p=1.0,
         )
 
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        }
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        ]
 
         response = await asyncio.to_thread(
             model.generate_content,

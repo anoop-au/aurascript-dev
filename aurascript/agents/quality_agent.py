@@ -21,16 +21,10 @@ from typing import Optional
 import structlog
 
 try:
-    import vertexai
-    from vertexai.generative_models import (
-        GenerationConfig,
-        GenerativeModel,
-        HarmBlockThreshold,
-        HarmCategory,
-    )
-    _VERTEX_AVAILABLE = True
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
 except ImportError:
-    _VERTEX_AVAILABLE = False
+    _GENAI_AVAILABLE = False
 
 from aurascript.agents.base_agent import BaseAgent
 from aurascript.config import Settings
@@ -131,15 +125,12 @@ class QualityAgent(BaseAgent):
         super().__init__(job_id, event_bus, settings)
         self._model: Optional[object] = None
 
-    def _get_model(self) -> "GenerativeModel":
-        if not _VERTEX_AVAILABLE:
-            raise RuntimeError("google-cloud-aiplatform not installed.")
+    def _get_model(self) -> "genai.GenerativeModel":
+        if not _GENAI_AVAILABLE:
+            raise RuntimeError("google-generativeai not installed.")
         if self._model is None:
-            vertexai.init(
-                project=self.settings.GOOGLE_CLOUD_PROJECT,
-                location=self.settings.GOOGLE_CLOUD_LOCATION,
-            )
-            self._model = GenerativeModel(self.settings.VERTEX_AI_MODEL_QUALITY)
+            genai.configure(api_key=self.settings.GEMINI_API_KEY)
+            self._model = genai.GenerativeModel(self.settings.VERTEX_AI_MODEL_QUALITY)
         return self._model  # type: ignore[return-value]
 
     async def run(self, input: QualityInput) -> QualityOutput:
@@ -259,7 +250,7 @@ class QualityAgent(BaseAgent):
             response = await asyncio.to_thread(
                 model.generate_content,
                 prompt,
-                generation_config=GenerationConfig(
+                generation_config=genai.GenerationConfig(
                     temperature=0.0,
                     max_output_tokens=512,
                     response_mime_type="application/json",
