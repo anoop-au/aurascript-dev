@@ -21,7 +21,8 @@ from typing import Optional
 import structlog
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
@@ -125,12 +126,11 @@ class QualityAgent(BaseAgent):
         super().__init__(job_id, event_bus, settings)
         self._model: Optional[object] = None
 
-    def _get_model(self) -> "genai.GenerativeModel":
+    def _get_client(self) -> "genai.Client":
         if not _GENAI_AVAILABLE:
-            raise RuntimeError("google-generativeai not installed.")
+            raise RuntimeError("google-genai not installed.")
         if self._model is None:
-            genai.configure(api_key=self.settings.GEMINI_API_KEY)
-            self._model = genai.GenerativeModel(self.settings.VERTEX_AI_MODEL_QUALITY)
+            self._model = genai.Client(api_key=self.settings.GEMINI_API_KEY)
         return self._model  # type: ignore[return-value]
 
     async def run(self, input: QualityInput) -> QualityOutput:
@@ -244,13 +244,13 @@ class QualityAgent(BaseAgent):
         _default = (0.7, [], "accept")
 
         try:
-            model = self._get_model()
+            client = self._get_client()
             prompt = _AI_QUALITY_PROMPT.format(transcript=transcript[:4000])
 
-            response = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.GenerationConfig(
+            response = await client.aio.models.generate_content(
+                model=self.settings.VERTEX_AI_MODEL_QUALITY,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
                     temperature=0.0,
                     max_output_tokens=512,
                     response_mime_type="application/json",

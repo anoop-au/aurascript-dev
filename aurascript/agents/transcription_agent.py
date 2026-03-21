@@ -27,17 +27,30 @@ import structlog
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
 
 try:
-    import google.api_core.exceptions
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
     _GENAI_AVAILABLE = True
 except ImportError:
+    genai_errors = None  # type: ignore
     _GENAI_AVAILABLE = False
+
+
+def _is_retryable_gemini_error(exc: BaseException) -> bool:
+    """Retry on 5xx server errors and 429 rate-limit responses only."""
+    if genai_errors is None:
+        return False
+    if isinstance(exc, genai_errors.ServerError):
+        return True
+    if isinstance(exc, genai_errors.ClientError) and getattr(exc, "code", 0) == 429:
+        return True
+    return False
 
 from aurascript.agents.base_agent import BaseAgent
 from aurascript.config import Settings
@@ -207,8 +220,8 @@ class TranscriptionAgent(BaseAgent):
     """
     Sends one audio chunk to Gemini 2.0 Flash and returns the transcript.
 
-    Vertex AI is initialised lazily on first run() call so tests can
-    construct this class without a real GCP project.
+    The Gemini client is initialised lazily on first run() call so tests can
+    construct this class without a real API key.
     """
 
     def __init__(
@@ -218,20 +231,17 @@ class TranscriptionAgent(BaseAgent):
         settings: Settings,
     ) -> None:
         super().__init__(job_id, event_bus, settings)
-        self._model: Optional[object] = None
+        self._client: Optional[object] = None
 
-    def _get_model(self) -> "genai.GenerativeModel":
+    def _get_client(self) -> "genai.Client":
         if not _GENAI_AVAILABLE:
             raise RuntimeError(
-                "google-generativeai is not installed. "
-                "Run: pip install google-generativeai"
+                "google-genai is not installed. "
+                "Run: pip install google-genai"
             )
-        if self._model is None:
-            genai.configure(api_key=self.settings.GEMINI_API_KEY)
-            self._model = genai.GenerativeModel(
-                self.settings.VERTEX_AI_MODEL_TRANSCRIBE
-            )
-        return self._model  # type: ignore[return-value]
+        if self._client is None:
+            self._client = genai.Client(api_key=self.settings.GEMINI_API_KEY)
+        return self._client  # type: ignore[return-value]
 
     async def run(
         self,
@@ -280,19 +290,7 @@ class TranscriptionAgent(BaseAgent):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type(
-            (
-                *(
-                    (
-                        google.api_core.exceptions.ResourceExhausted,
-                        google.api_core.exceptions.ServiceUnavailable,
-                        google.api_core.exceptions.DeadlineExceeded,
-                    )
-                    if _GENAI_AVAILABLE
-                    else ()
-                ),
-            )
-        ),
+        retry=retry_if_exception(_is_retryable_gemini_error),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -300,7 +298,7 @@ class TranscriptionAgent(BaseAgent):
         self, input: TranscriptionInput, is_retry: bool
     ) -> TranscriptionOutput:
         """Send the audio chunk to Gemini and parse the response."""
-        model = self._get_model()
+        client = self._get_client()
 
         system_prompt = _build_system_prompt(
             input.language_hint, input.num_speakers, is_retry
@@ -308,26 +306,32 @@ class TranscriptionAgent(BaseAgent):
 
         # Read audio bytes from disk.
         audio_bytes = input.chunk_path.read_bytes()
-        audio_part = {"mime_type": "audio/mpeg", "data": audio_bytes}
 
-        generation_config = genai.GenerationConfig(
-            temperature=0.0,        # Deterministic — critical for accuracy
-            max_output_tokens=8192,
-            top_p=1.0,
-        )
-
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        ]
-
-        response = await asyncio.to_thread(
-            model.generate_content,
-            [system_prompt, audio_part],
-            generation_config=generation_config,
-            safety_settings=safety_settings,
+        response = await client.aio.models.generate_content(
+            model=self.settings.VERTEX_AI_MODEL_TRANSCRIBE,
+            contents=genai_types.Part.from_bytes(
+                data=audio_bytes, mime_type="audio/mpeg"
+            ),
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.0,        # Deterministic — critical for accuracy
+                max_output_tokens=8192,
+                top_p=1.0,
+                safety_settings=[
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
+                    ),
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
+                    ),
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
+                    ),
+                    genai_types.SafetySetting(
+                        category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+                    ),
+                ],
+            ),
         )
 
         raw_text = response.text

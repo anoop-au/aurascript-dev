@@ -2,7 +2,7 @@
 AuraScript — FastAPI application entry point.
 
 Responsibilities:
-- Lifespan: startup (dirs, Vertex AI init, orphan cleanup, periodic cleanup task)
+- Lifespan: startup (dirs, orphan cleanup, periodic cleanup task)
          and shutdown (graceful task cancellation).
 - Middleware stack: TrustedHost → CORS → Request ID injection.
 - Exception handlers: validation errors, audio errors, generic 500s.
@@ -62,18 +62,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Ensure temporary directories exist.
     settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     settings.CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Initialise Vertex AI (lazy — agents still init individually, but this
-    # validates the credentials path at startup rather than at first request).
-    try:
-        import vertexai
-        vertexai.init(
-            project=settings.GOOGLE_CLOUD_PROJECT,
-            location=settings.GOOGLE_CLOUD_LOCATION,
-        )
-        logger.info("vertex_ai_initialized", project=settings.GOOGLE_CLOUD_PROJECT)
-    except Exception as exc:
-        logger.warning("vertex_ai_init_failed", error=str(exc))
 
     # Scan for orphaned temp files from a previous crash.
     storage = SafeFileStorage()
