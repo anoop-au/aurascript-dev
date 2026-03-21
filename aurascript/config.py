@@ -68,6 +68,10 @@ class Settings(BaseSettings):
         "http://localhost:5173",                # Vite dev server
     ]
 
+    # ── Anthropic Claude API ──────────────────────────────────────────
+    # API key from https://console.anthropic.com/
+    ANTHROPIC_API_KEY: str = ""
+
     # ── Google Gemini API ─────────────────────────────────────────────
     # API key from https://aistudio.google.com/app/apikey
     GEMINI_API_KEY: str

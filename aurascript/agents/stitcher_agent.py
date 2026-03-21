@@ -11,18 +11,12 @@ to concatenated raw text — the pipeline never crashes on a parse error.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from typing import Optional
 
+import anthropic
 import structlog
-
-try:
-    import google.generativeai as genai
-    _GENAI_AVAILABLE = True
-except ImportError:
-    _GENAI_AVAILABLE = False
 
 from aurascript.agents.base_agent import BaseAgent
 from aurascript.config import Settings
@@ -168,13 +162,13 @@ def _parse_stitch_response(
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
 
-    # Tier 3: use raw as transcript.
-    logger.warning("stitch_json_parse_failed_using_raw", raw_preview=raw[:300])
-    transcript = raw.strip() or fallback_transcript
+    # Tier 3: JSON parse failed (likely truncated output) — use the full
+    # fallback transcript so users always get all chunks, not garbage JSON.
+    logger.warning("stitch_json_parse_failed_using_fallback", raw_preview=raw[:300])
     return StitcherOutput(
-        transcript=transcript,
+        transcript=fallback_transcript,
         speaker_map={},
-        word_count=_word_count(transcript),
+        word_count=_word_count(fallback_transcript),
         languages_detected=["unknown"],
     )
 
@@ -191,15 +185,14 @@ class StitcherAgent(BaseAgent):
         settings: Settings,
     ) -> None:
         super().__init__(job_id, event_bus, settings)
-        self._model: Optional[object] = None
+        self._client: Optional[anthropic.AsyncAnthropic] = None
 
-    def _get_model(self) -> "genai.GenerativeModel":
-        if not _GENAI_AVAILABLE:
-            raise RuntimeError("google-generativeai not installed.")
-        if self._model is None:
-            genai.configure(api_key=self.settings.GEMINI_API_KEY)
-            self._model = genai.GenerativeModel(self.settings.VERTEX_AI_MODEL_STITCH)
-        return self._model  # type: ignore[return-value]
+    def _get_client(self) -> anthropic.AsyncAnthropic:
+        if self._client is None:
+            self._client = anthropic.AsyncAnthropic(
+                api_key=self.settings.ANTHROPIC_API_KEY
+            )
+        return self._client
 
     async def run(self, input: StitcherInput) -> StitcherOutput:
         """
@@ -215,7 +208,7 @@ class StitcherAgent(BaseAgent):
             c.transcript for c in input.corrected_chunks
         )
 
-        output = await self._call_gemini(
+        output = await self._call_claude(
             system_prompt, input_text, fallback_transcript
         )
 
@@ -249,40 +242,32 @@ class StitcherAgent(BaseAgent):
 
         return output
 
-    async def _call_gemini(
+    async def _call_claude(
         self,
         system_prompt: str,
         input_text: str,
         fallback_transcript: str,
     ) -> StitcherOutput:
         """
-        Call Gemini with the assembled transcript and parse the response.
+        Call Claude with the assembled transcript and parse the response.
         Never raises — falls back gracefully on any error.
         """
         try:
-            model = self._get_model()
+            client = self._get_client()
 
-            response = await asyncio.to_thread(
-                model.generate_content,
-                f"{system_prompt}\n\n{input_text}",
-                generation_config=genai.GenerationConfig(
-                    temperature=0.0,
-                    max_output_tokens=8192,
-                    response_mime_type="application/json",
-                ),
-                safety_settings=[
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                ],
+            response = await client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=8192,
+                system=system_prompt,
+                messages=[{"role": "user", "content": input_text}],
             )
 
-            return _parse_stitch_response(response.text, fallback_transcript)
+            raw = response.content[0].text
+            return _parse_stitch_response(raw, fallback_transcript)
 
         except Exception as exc:
             self.logger.error(
-                "stitcher_gemini_call_failed",
+                "stitcher_claude_call_failed",
                 error=str(exc),
             )
             # Return a minimal valid output so the pipeline can still complete.
