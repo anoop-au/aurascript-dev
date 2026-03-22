@@ -1,15 +1,17 @@
 """
 AuraScript — TranscriptionAgent.
 
-Sends a single audio chunk to Gemini 2.0 Flash via Vertex AI and returns
-a structured transcript + metadata using native JSON schema output.
+Sends a single audio chunk to Gemini via the google-genai SDK and returns
+a plain-text transcript + metadata using a hybrid separator approach.
 
 Key design decisions:
+- Plain text transcript (no JSON encoding) avoids Unicode token inflation for
+  Malayalam/CJK scripts — critical for cost control and avoiding output limits.
+- Metadata extracted from a small ---JSON_METADATA--- block appended by the model.
 - temperature=0.0 for deterministic, accurate output.
 - BLOCK_NONE safety settings — transcription of real conversations requires
   unfiltered output (slang, profanity, sensitive topics all appear in audio).
 - Tenacity retry on transient Google API errors (rate limits, timeouts).
-- response_schema=GeminiChunkResponse guarantees valid JSON — no regex needed.
 - is_retry=True adds an explicit instruction to the prompt telling Gemini
   that a previous attempt was flagged for quality issues.
 """
@@ -17,10 +19,9 @@ Key design decisions:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Optional
-
-from pydantic import BaseModel
 
 import structlog
 from tenacity import (
@@ -67,15 +68,7 @@ from aurascript.services.event_bus import EventBus
 
 logger = structlog.get_logger(__name__)
 
-
-class GeminiChunkResponse(BaseModel):
-    """Strict schema Gemini must return for each audio chunk."""
-    transcript: str
-    detected_languages: list[str]
-    speaker_count: int
-    confidence: float
-    issues: list[str]
-
+_JSON_METADATA_SEPARATOR = "---JSON_METADATA---"
 
 # Verbatim system prompt — do NOT alter. This is the 97% accuracy prompt.
 _SYSTEM_PROMPT_TEMPLATE = """\
@@ -130,13 +123,22 @@ YOUR ABSOLUTE RULES:
    unless the speaker is explicitly spelling something out.
    Ensure correct usage of chillaksharam (ൽ, ൾ, ൺ, ൻ, ർ).
 
-8. OUTPUT FORMAT (MANDATORY)
-   Return a single JSON object with these exact fields:
-   - "transcript": the full verbatim transcript text (string)
-   - "detected_languages": list of language names spoken (e.g. ["English", "Mandarin"])
-   - "speaker_count": number of distinct speakers detected (integer)
-   - "confidence": transcription confidence 0.0–1.0 (float)
-   - "issues": list of issues from [audio_cutoff, noise, overlap, low_quality] — empty list if none
+8. OUTPUT FORMAT (MANDATORY — follow exactly)
+   First output the full verbatim transcript.
+   Then on a new line output exactly: ---JSON_METADATA---
+   Then on the next line output a single valid JSON object with these fields:
+   {{"detected_languages": ["English", "Malayalam"], "speaker_count": 2, "confidence": 0.95, "issues": []}}
+
+   - detected_languages: list of language names spoken
+   - speaker_count: number of distinct speakers (integer)
+   - confidence: transcription confidence 0.0–1.0 (float)
+   - issues: list from [audio_cutoff, noise, overlap, low_quality] — empty list if none
+
+   Example:
+   [00:00] [Speaker A]: Hello, how are you?
+   [00:03] [Speaker B]: Fine, thank you.
+   ---JSON_METADATA---
+   {{"detected_languages": ["English"], "speaker_count": 2, "confidence": 0.97, "issues": []}}
 
 {language_hint_instruction}
 Expected speakers in this chunk: {num_speakers}
@@ -169,9 +171,75 @@ def _build_system_prompt(
     return prompt
 
 
+def _parse_metadata(response_text: str) -> tuple[str, TranscriptionMetadata]:
+    """
+    Split the hybrid response into plain-text transcript and JSON metadata.
+
+    The model outputs:
+        <transcript text>
+        ---JSON_METADATA---
+        {"detected_languages": [...], "speaker_count": N, ...}
+
+    Never raises. Falls back safely on missing or malformed JSON.
+    """
+    if _JSON_METADATA_SEPARATOR not in response_text:
+        logger.warning(
+            "json_metadata_separator_missing",
+            response_preview=response_text[:200],
+        )
+        return response_text.strip(), TranscriptionMetadata(
+            detected_languages=["unknown"],
+            speaker_count=1,
+            confidence=0.5,
+            issues=["metadata_missing"],
+        )
+
+    parts = response_text.split(_JSON_METADATA_SEPARATOR, 1)
+    transcript = parts[0].strip()
+    json_str = parts[1].strip()
+
+    # Strip markdown code fences if the model accidentally added them.
+    if json_str.startswith("```"):
+        json_str = json_str.split("\n", 1)[-1]
+        if json_str.endswith("```"):
+            json_str = json_str.rsplit("```", 1)[0]
+        json_str = json_str.strip()
+
+    try:
+        data = json.loads(json_str)
+
+        langs = data.get("detected_languages", [])
+        if not isinstance(langs, list):
+            langs = ["unknown"]
+
+        issues = data.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+
+        return transcript, TranscriptionMetadata(
+            detected_languages=[str(l) for l in langs] or ["unknown"],
+            speaker_count=int(data.get("speaker_count", 1)),
+            confidence=max(0.0, min(1.0, float(data.get("confidence", 0.5)))),
+            issues=[str(i) for i in issues if str(i).lower() != "none"],
+        )
+
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        logger.warning(
+            "json_metadata_parse_failed",
+            error=str(exc),
+            json_preview=json_str[:200],
+        )
+        return transcript, TranscriptionMetadata(
+            detected_languages=["unknown"],
+            speaker_count=1,
+            confidence=0.5,
+            issues=["json_parse_failed"],
+        )
+
+
 class TranscriptionAgent(BaseAgent):
     """
-    Sends one audio chunk to Gemini 2.0 Flash and returns the transcript.
+    Sends one audio chunk to Gemini and returns the transcript.
 
     The Gemini client is initialised lazily on first run() call so tests can
     construct this class without a real API key.
@@ -257,7 +325,6 @@ class TranscriptionAgent(BaseAgent):
             input.language_hint, input.num_speakers, is_retry
         )
 
-        # Read audio bytes from disk.
         audio_bytes = input.chunk_path.read_bytes()
 
         response = await client.aio.models.generate_content(
@@ -268,10 +335,8 @@ class TranscriptionAgent(BaseAgent):
             config=genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.0,        # Deterministic — critical for accuracy
-                max_output_tokens=65536,
+                max_output_tokens=8192,
                 top_p=1.0,
-                response_mime_type="application/json",
-                response_schema=GeminiChunkResponse,
                 safety_settings=[
                     genai_types.SafetySetting(
                         category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
@@ -289,23 +354,10 @@ class TranscriptionAgent(BaseAgent):
             ),
         )
 
-        # Gemini sometimes wraps JSON in markdown fences despite response_mime_type.
-        raw = (response.text or "").strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1]
-            if raw.endswith("```"):
-                raw = raw.rsplit("```", 1)[0]
-            raw = raw.strip()
-
-        parsed = GeminiChunkResponse.model_validate_json(raw)
+        transcript, metadata = _parse_metadata(response.text or "")
 
         return TranscriptionOutput(
-            transcript=parsed.transcript,
-            metadata=TranscriptionMetadata(
-                detected_languages=parsed.detected_languages or ["unknown"],
-                speaker_count=parsed.speaker_count,
-                confidence=max(0.0, min(1.0, parsed.confidence)),
-                issues=parsed.issues,
-            ),
+            transcript=transcript,
+            metadata=metadata,
             chunk_index=input.chunk_index,
         )
