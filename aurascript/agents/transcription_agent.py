@@ -268,7 +268,7 @@ class TranscriptionAgent(BaseAgent):
             config=genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.0,        # Deterministic — critical for accuracy
-                max_output_tokens=16384,
+                max_output_tokens=65536,
                 top_p=1.0,
                 response_mime_type="application/json",
                 response_schema=GeminiChunkResponse,
