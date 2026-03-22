@@ -39,20 +39,28 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _STITCH_SYSTEM_PROMPT = """\
-You are AuraScript's transcript analysis engine.
+You are AuraScript's transcript unification engine.
 
 INPUT: A Manglish transcript assembled from sequential audio chunks.
 Each chunk is prefixed with its index: === CHUNK N ===
 Chunks marked ⚠️ LOW CONFIDENCE were flagged during quality checks — treat with caution.
+Each chunk (except the first) is preceded by a "--- Speaker Bridge ---" section showing
+the last 3 speaker turns of the previous chunk. Use this to maintain speaker continuity.
 
 YOUR TASKS:
 
-TASK 1: GLOBAL SPEAKER UNIFICATION
-Speaker labels reset at every chunk boundary. The same person may be called
-[Speaker A] in chunk 0 and [Speaker B] in chunk 1.
-Analyse conversation context, speaking style, vocabulary, and turn-taking patterns.
-Assign globally consistent labels: Speaker 1, Speaker 2, etc.
-If genuinely uncertain, use Speaker ? — NEVER guess.
+TASK 1: GLOBAL SPEAKER UNIFICATION — SPEAKER REGISTRY
+You must maintain a Speaker Registry as you process each chunk in order.
+Rules:
+- Start with an empty registry. When you first encounter a voice in Chunk 0, assign
+  them "Speaker 1", the next new voice "Speaker 2", etc.
+- For each subsequent chunk, consult the Speaker Bridge. If a local label (e.g.
+  "Speaker B" in Chunk 2) matches the same voice as a speaker already in your
+  registry, map them to that existing global label.
+- If a genuinely new voice appears that was not in any previous chunk, assign the
+  next sequential number.
+- Assign a numbered global label to EVERY local label — never leave any speaker
+  unassigned.
 
 TASK 2: BOUNDARY WORD REPAIR
 Find all [cut-off] markers. Look at the adjacent chunk for context.
@@ -85,17 +93,37 @@ Expected number of unique speakers: {num_speakers}
 # ---------------------------------------------------------------------------
 
 
+def _extract_speaker_tail(transcript: str, n_lines: int = 3) -> str:
+    """Return the last n timestamped speaker turns from a chunk transcript."""
+    lines = [
+        line.strip() for line in transcript.splitlines()
+        if re.match(r"\[\d{2}:\d{2}\]", line.strip())
+    ]
+    return "\n".join(lines[-n_lines:]) if lines else ""
+
+
 def _build_stitcher_input_text(stitch_input: StitcherInput) -> str:
     """
-    Assemble the transcript text to send to the LLM, with clear chunk index
-    markers so the model can reference specific chunks in its JSON output.
+    Assemble the transcript text to send to the LLM.
+
+    Each chunk is prefixed with its index marker. From chunk 1 onwards, a
+    Speaker Bridge section shows the last 3 turns of the previous chunk so
+    Claude can resolve speaker identity across boundaries.
     """
+    chunks = stitch_input.corrected_chunks
     parts: list[str] = []
-    for chunk in stitch_input.corrected_chunks:
+    for i, chunk in enumerate(chunks):
+        # Inject speaker bridge from the previous chunk's tail.
+        if i > 0:
+            tail = _extract_speaker_tail(chunks[i - 1].transcript)
+            if tail:
+                parts.append(
+                    f"--- Speaker Bridge (last turns of Chunk {i - 1}) ---\n{tail}"
+                )
         is_low_confidence = chunk.chunk_index in stitch_input.low_confidence_indexes
         warning = "⚠️ LOW CONFIDENCE — treat with caution\n" if is_low_confidence else ""
         parts.append(f"=== CHUNK {chunk.chunk_index} ===\n{warning}{chunk.transcript}")
-    return "\n".join(parts)
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +326,7 @@ class StitcherAgent(BaseAgent):
             client = self._get_client()
             response = await client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=2048,
+                max_tokens=4096,
                 system=system_prompt,
                 messages=[{"role": "user", "content": input_text}],
                 timeout=60.0,
