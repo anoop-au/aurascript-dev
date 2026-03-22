@@ -289,7 +289,15 @@ class TranscriptionAgent(BaseAgent):
             ),
         )
 
-        parsed = GeminiChunkResponse.model_validate_json(response.text)
+        # Gemini sometimes wraps JSON in markdown fences despite response_mime_type.
+        raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            if raw.endswith("```"):
+                raw = raw.rsplit("```", 1)[0]
+            raw = raw.strip()
+
+        parsed = GeminiChunkResponse.model_validate_json(raw)
 
         return TranscriptionOutput(
             transcript=parsed.transcript,
