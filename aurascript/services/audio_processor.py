@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import structlog
 
@@ -300,3 +300,116 @@ async def chunk_audio(
     )
 
     return chunk_paths
+
+
+async def stream_chunk_audio(
+    input_path: Path,
+    job_id: str,
+    analysis: AudioAnalysis,
+) -> AsyncGenerator[Path, None]:
+    """
+    Split *input_path* into fixed-duration MP3 chunks and yield each path
+    the instant ffmpeg closes and flushes it — without waiting for the full
+    file to be split first.
+
+    Uses ffmpeg's -segment_list feature: ffmpeg appends each closed chunk's
+    filename to a CSV file as soon as the chunk is safe to read.  Python
+    tails that file every 0.5 s and yields new paths to the caller
+    immediately, allowing transcription to start in parallel with chunking.
+
+    Raises AudioProcessingError if ffmpeg exits non-zero or produces no chunks.
+    """
+    output_dir = settings.CHUNKS_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    list_file = output_dir / "chunk_list.csv"
+    output_pattern = str(output_dir / "chunk_%04d.mp3")
+
+    args = [
+        "ffmpeg",
+        "-i", str(input_path),
+        "-f", "segment",
+        "-segment_time", str(settings.CHUNK_DURATION_SECONDS),
+        "-segment_list", str(list_file),   # ffmpeg writes chunk names here
+        "-segment_list_type", "csv",
+        "-c:a", "libmp3lame",
+        "-q:a", "4",
+        "-ar", "16000",
+        "-ac", "1",
+        "-reset_timestamps", "1",
+        "-loglevel", "error",
+        output_pattern,
+    ]
+
+    logger.info(
+        "ffmpeg_stream_chunk_start",
+        job_id=job_id,
+        input=str(input_path),
+        chunk_duration=settings.CHUNK_DURATION_SECONDS,
+        output_dir=str(output_dir),
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise AudioProcessingError(
+            "ffmpeg not found. Ensure ffmpeg is installed on this host.",
+            returncode=None,
+        ) from exc
+
+    yielded: set[str] = set()
+
+    def _drain_list_file() -> list[Path]:
+        """Return newly-listed chunk paths not yet yielded (file must exist)."""
+        if not list_file.exists():
+            return []
+        new_paths: list[Path] = []
+        with open(list_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                chunk_filename = line.split(",")[0].strip()
+                if chunk_filename and chunk_filename not in yielded:
+                    chunk_path = output_dir / chunk_filename
+                    if chunk_path.exists():   # only yield once file is on disk
+                        yielded.add(chunk_filename)
+                        new_paths.append(chunk_path)
+        return new_paths
+
+    # Poll while ffmpeg is running.
+    while proc.returncode is None:
+        for path in _drain_list_file():
+            yield path
+        await asyncio.sleep(0.5)
+
+    # Final drain — catch any entries written in the last poll window.
+    for path in _drain_list_file():
+        yield path
+
+    # Reap the process and collect stderr.
+    _, stderr_bytes = await proc.communicate()
+
+    if proc.returncode != 0:
+        raise AudioProcessingError(
+            f"ffmpeg chunking failed for job {job_id}.",
+            ffmpeg_stderr=stderr_bytes.decode(errors="replace"),
+            returncode=proc.returncode,
+        )
+
+    if not yielded:
+        raise AudioProcessingError(
+            f"ffmpeg produced zero chunks for job {job_id}. "
+            "The input file may be silent or unreadable.",
+            returncode=proc.returncode,
+        )
+
+    logger.info(
+        "ffmpeg_stream_chunk_complete",
+        job_id=job_id,
+        chunk_count=len(yielded),
+    )

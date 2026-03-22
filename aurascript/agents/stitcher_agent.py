@@ -1,12 +1,16 @@
 """
-AuraScript — StitcherAgent.
+AuraScript — StitcherAgent (Map-Reduce / Metadata-only).
 
-Takes all corrected, timestamp-adjusted chunk transcripts and sends them to
-Gemini 2.0 Flash for global speaker unification, boundary word repair, and
-final format cleanup.
+The LLM is asked only for a small JSON correction payload:
+  - speaker_assignments: maps per-chunk local labels → global labels
+  - boundary_fixes: targeted [cut-off] repairs
+  - languages_detected
 
-On JSON parse failure the agent attempts regex extraction, then falls back
-to concatenated raw text — the pipeline never crashes on a parse error.
+All text manipulation (label substitution, boundary repair, concatenation)
+is done in Python — the LLM never rewrites the full transcript.
+
+On JSON parse failure the agent falls back to concatenated raw chunks so the
+pipeline never crashes.
 """
 
 from __future__ import annotations
@@ -30,114 +34,161 @@ from aurascript.services.event_bus import EventBus
 
 logger = structlog.get_logger(__name__)
 
-_CHUNK_SEPARATOR = "\n--- CHUNK BOUNDARY ---\n"
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
 
-# Verbatim stitching system prompt — do NOT alter.
-_STITCH_SYSTEM_PROMPT_TEMPLATE = """\
-You are AuraScript's transcript unification engine.
+_STITCH_SYSTEM_PROMPT = """\
+You are AuraScript's transcript analysis engine.
 
 INPUT: A Manglish transcript assembled from sequential audio chunks.
-Chunks are separated by '--- CHUNK BOUNDARY ---'.
-Sections marked with ⚠️ LOW CONFIDENCE were flagged during quality checks.
+Each chunk is prefixed with its index: === CHUNK N ===
+Chunks marked ⚠️ LOW CONFIDENCE were flagged during quality checks — treat with caution.
 
-YOUR TASKS — execute in this exact order:
+YOUR TASKS:
 
 TASK 1: GLOBAL SPEAKER UNIFICATION
- Speaker labels reset at every chunk boundary. The same person may be
- called [Speaker A] in chunk 1 and [Speaker B] in chunk 2.
-
- Analyze:
- - Conversation context and topic continuity
- - Speaking style, vocabulary, and language preferences
- - Turn-taking patterns around chunk boundaries
-
- Assign globally consistent labels: [Speaker 1], [Speaker 2], etc.
- If you genuinely cannot identify a speaker, use [Speaker ?].
- NEVER guess. Uncertainty is better than a wrong label.
+Speaker labels reset at every chunk boundary. The same person may be called
+[Speaker A] in chunk 0 and [Speaker B] in chunk 1.
+Analyse conversation context, speaking style, vocabulary, and turn-taking patterns.
+Assign globally consistent labels: Speaker 1, Speaker 2, etc.
+If genuinely uncertain, use Speaker ? — NEVER guess.
 
 TASK 2: BOUNDARY WORD REPAIR
- Find all [cut-off] markers.
- Look at the immediately following chunk for context.
- If you can reconstruct the word with confidence: complete it.
- If not: replace with [inaudible].
+Find all [cut-off] markers. Look at the adjacent chunk for context.
+If you can reconstruct the word with confidence, provide the replacement text.
+If not, use [inaudible].
 
-TASK 3: OUTPUT CLEANUP
- Remove all '--- CHUNK BOUNDARY ---' markers.
- Remove all ⚠️ LOW CONFIDENCE warning lines.
- Keep ALL timestamps exactly as-is (do not alter any timestamp).
- Keep ALL native language words exactly as-is (no translation).
- Do NOT add, remove, paraphrase, or summarize ANY content.
+OUTPUT FORMAT — respond with ONLY this JSON, no other text:
+{{
+  "speaker_assignments": [
+    {{"chunk_index": 0, "local": "Speaker A", "global": "Speaker 1"}},
+    {{"chunk_index": 1, "local": "Speaker B", "global": "Speaker 1"}}
+  ],
+  "boundary_fixes": [
+    {{"chunk_index": 1, "original": "[cut-off]", "replacement": "complete_word"}}
+  ],
+  "languages_detected": ["English", "Malayalam"]
+}}
 
-TASK 4: FINAL FORMAT
- [MM:SS] [Speaker N]: <verbatim text>
- Use [HH:MM:SS] if total duration exceeds 60 minutes.
-
-TASK 5: JSON OUTPUT (mandatory)
- Respond with ONLY this JSON object, no other text:
- {{
-   "transcript": "<complete unified transcript>",
-   "speaker_map": {{
-     "Speaker 1": "<description or 'unknown'>",
-     "Speaker 2": "<description or 'unknown'>"
-   }},
-   "word_count": <integer>,
-   "languages_detected": ["<lang1>", "<lang2>"]
- }}
-
+If there are no boundary fixes needed, output an empty array for boundary_fixes.
 Expected number of unique speakers: {num_speakers}
 """
+
+# ---------------------------------------------------------------------------
+# Input builder
+# ---------------------------------------------------------------------------
 
 
 def _build_stitcher_input_text(stitch_input: StitcherInput) -> str:
     """
-    Assemble the full transcript text to send to Gemini.
-
-    Low-confidence chunks are prefixed with a ⚠️ warning line so the
-    stitcher knows to treat them with extra caution.
+    Assemble the transcript text to send to the LLM, with clear chunk index
+    markers so the model can reference specific chunks in its JSON output.
     """
     parts: list[str] = []
     for chunk in stitch_input.corrected_chunks:
-        is_low_confidence = (
-            chunk.chunk_index in stitch_input.low_confidence_indexes
-        )
-        prefix = "⚠️ LOW CONFIDENCE — treat with caution:\n" if is_low_confidence else ""
-        parts.append(f"{prefix}{chunk.transcript}")
-    return _CHUNK_SEPARATOR.join(parts)
+        is_low_confidence = chunk.chunk_index in stitch_input.low_confidence_indexes
+        warning = "⚠️ LOW CONFIDENCE — treat with caution\n" if is_low_confidence else ""
+        parts.append(f"=== CHUNK {chunk.chunk_index} ===\n{warning}{chunk.transcript}")
+    return "\n".join(parts)
 
 
-def _parse_stitch_response(
-    raw: str,
-    fallback_transcript: str,
-) -> StitcherOutput:
+# ---------------------------------------------------------------------------
+# Programmatic correction application
+# ---------------------------------------------------------------------------
+
+
+def _apply_corrections(
+    stitch_input: StitcherInput,
+    speaker_assignments: list[dict],
+    boundary_fixes: list[dict],
+) -> str:
     """
-    Parse Gemini's JSON response into a StitcherOutput.
+    Apply LLM-provided corrections to the raw chunk transcripts in Python.
+
+    1. Per-chunk speaker label substitution  (local → global)
+    2. Per-chunk boundary word repair        ([cut-off] → completion)
+    3. Concatenate all chunks into one transcript
+    """
+    # Build (chunk_index, local_label) → global_label lookup.
+    speaker_lookup: dict[tuple[int, str], str] = {}
+    for assignment in speaker_assignments:
+        try:
+            key = (int(assignment["chunk_index"]), str(assignment["local"]))
+            speaker_lookup[key] = str(assignment["global"])
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    # Build chunk_index → [(original, replacement)] lookup.
+    fix_lookup: dict[int, list[tuple[str, str]]] = {}
+    for fix in boundary_fixes:
+        try:
+            idx = int(fix["chunk_index"])
+            fix_lookup.setdefault(idx, []).append(
+                (str(fix["original"]), str(fix["replacement"]))
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    processed: list[str] = []
+    for chunk in stitch_input.corrected_chunks:
+        text = chunk.transcript
+
+        # Replace all local speaker labels for this chunk.
+        # Transcript lines look like: [MM:SS] [Speaker A]: …
+        local_labels_found = set(re.findall(r"\[Speaker ([^\]]+)\]", text))
+        for label_body in local_labels_found:
+            local_label = f"Speaker {label_body}"
+            global_label = speaker_lookup.get((chunk.chunk_index, local_label))
+            if global_label:
+                text = text.replace(f"[{local_label}]", f"[{global_label}]")
+
+        # Apply boundary fixes for this chunk (first occurrence each).
+        for original, replacement in fix_lookup.get(chunk.chunk_index, []):
+            text = text.replace(original, replacement, 1)
+
+        processed.append(text.strip())
+
+    return "\n".join(processed)
+
+
+# ---------------------------------------------------------------------------
+# Response parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_stitch_response(raw: str, stitch_input: StitcherInput) -> StitcherOutput:
+    """
+    Parse the LLM's metadata JSON and apply corrections programmatically.
 
     Three-tier fallback:
     1. Direct json.loads on the full response.
     2. Regex extraction of the first {...} block.
-    3. Use raw response as transcript with empty speaker_map.
-
-    Never raises.
+    3. Plain concatenation of raw chunks — never crashes.
     """
-    def _word_count(text: str) -> int:
-        return len(text.split())
+    fallback_transcript = "\n".join(c.transcript for c in stitch_input.corrected_chunks)
+
+    def _build_output(data: dict) -> StitcherOutput:
+        speaker_assignments = data.get("speaker_assignments", [])
+        boundary_fixes = data.get("boundary_fixes", [])
+        languages = [str(l) for l in data.get("languages_detected", ["unknown"])]
+
+        transcript = _apply_corrections(stitch_input, speaker_assignments, boundary_fixes)
+
+        # speaker_map: global_label → "unknown" (descriptions not provided in metadata mode)
+        unique_globals = {str(a["global"]) for a in speaker_assignments if "global" in a}
+        speaker_map = {g: "unknown" for g in sorted(unique_globals)}
+
+        return StitcherOutput(
+            transcript=transcript,
+            speaker_map=speaker_map,
+            word_count=len(transcript.split()),
+            languages_detected=languages,
+        )
 
     # Tier 1: direct parse.
     try:
-        data = json.loads(raw)
-        return StitcherOutput(
-            transcript=str(data.get("transcript", fallback_transcript)),
-            speaker_map={
-                str(k): str(v)
-                for k, v in data.get("speaker_map", {}).items()
-            },
-            word_count=int(
-                data.get("word_count", _word_count(data.get("transcript", "")))
-            ),
-            languages_detected=[
-                str(l) for l in data.get("languages_detected", ["unknown"])
-            ],
-        )
+        return _build_output(json.loads(raw))
     except (json.JSONDecodeError, KeyError, ValueError):
         pass
 
@@ -145,37 +196,30 @@ def _parse_stitch_response(
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
-            data = json.loads(match.group(0))
-            return StitcherOutput(
-                transcript=str(data.get("transcript", fallback_transcript)),
-                speaker_map={
-                    str(k): str(v)
-                    for k, v in data.get("speaker_map", {}).items()
-                },
-                word_count=int(
-                    data.get("word_count", _word_count(data.get("transcript", "")))
-                ),
-                languages_detected=[
-                    str(l) for l in data.get("languages_detected", ["unknown"])
-                ],
-            )
+            return _build_output(json.loads(match.group(0)))
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
 
-    # Tier 3: JSON parse failed (likely truncated output) — use the full
-    # fallback transcript so users always get all chunks, not garbage JSON.
+    # Tier 3: plain fallback.
     logger.warning("stitch_json_parse_failed_using_fallback", raw_preview=raw[:300])
     return StitcherOutput(
         transcript=fallback_transcript,
         speaker_map={},
-        word_count=_word_count(fallback_transcript),
+        word_count=len(fallback_transcript.split()),
         languages_detected=["unknown"],
     )
 
 
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+
 class StitcherAgent(BaseAgent):
     """
-    Unifies all chunk transcripts into a single coherent final transcript.
+    Unifies all chunk transcripts into a single coherent final transcript
+    using a Map-Reduce approach: the LLM outputs only correction metadata,
+    Python applies the corrections.
     """
 
     def __init__(
@@ -195,30 +239,19 @@ class StitcherAgent(BaseAgent):
         return self._client
 
     async def run(self, input: StitcherInput) -> StitcherOutput:
-        """
-        Send all chunks to Gemini for unification and return StitcherOutput.
-        """
+        """Send chunks to Claude for metadata, apply corrections in Python."""
         await self.emit(self._make_event(StitchingStartedEvent))
 
         input_text = _build_stitcher_input_text(input)
-        system_prompt = _STITCH_SYSTEM_PROMPT_TEMPLATE.format(
-            num_speakers=input.num_speakers
-        )
-        fallback_transcript = _CHUNK_SEPARATOR.join(
-            c.transcript for c in input.corrected_chunks
-        )
+        system_prompt = _STITCH_SYSTEM_PROMPT.format(num_speakers=input.num_speakers)
 
-        output = await self._call_claude(
-            system_prompt, input_text, fallback_transcript
-        )
+        output = await self._call_claude(system_prompt, input_text, input)
 
-        # Build a 5-line preview for the StitchingCompleteEvent.
         preview_lines = [
             line for line in output.transcript.splitlines() if line.strip()
         ][:5]
 
         await self.emit(self._make_event(StitchingCompleteEvent))
-
         await self.emit(
             self._make_event(
                 AgentDecisionEvent,
@@ -246,31 +279,30 @@ class StitcherAgent(BaseAgent):
         self,
         system_prompt: str,
         input_text: str,
-        fallback_transcript: str,
+        stitch_input: StitcherInput,
     ) -> StitcherOutput:
         """
-        Call Claude with the assembled transcript and parse the response.
+        Call Claude for correction metadata only (not the full transcript).
+        max_tokens is 2048 — sufficient for JSON metadata on any realistic job.
         Never raises — falls back gracefully on any error.
         """
+        fallback_transcript = "\n".join(
+            c.transcript for c in stitch_input.corrected_chunks
+        )
         try:
             client = self._get_client()
-
             response = await client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=8192,
+                model="claude-3-5-sonnet-latest",
+                max_tokens=2048,
                 system=system_prompt,
                 messages=[{"role": "user", "content": input_text}],
+                timeout=60.0,
             )
-
             raw = response.content[0].text
-            return _parse_stitch_response(raw, fallback_transcript)
+            return _parse_stitch_response(raw, stitch_input)
 
         except Exception as exc:
-            self.logger.error(
-                "stitcher_claude_call_failed",
-                error=str(exc),
-            )
-            # Return a minimal valid output so the pipeline can still complete.
+            self.logger.error("stitcher_claude_call_failed", error=str(exc))
             return StitcherOutput(
                 transcript=fallback_transcript,
                 speaker_map={},

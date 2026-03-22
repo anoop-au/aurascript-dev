@@ -8,12 +8,10 @@ Pipeline stages:
   1. ANALYZE   — ffprobe audio analysis
   2. PLAN      — compute chunk strategy and estimates
   3. CHUNK     — ffmpeg audio splitting
-  4. TRANSCRIBE — parallel Gemini transcription (semaphore-limited)
-  5. QUALITY   — parallel quality scoring
-  6. RETRY     — single retry for low-quality chunks
-  7. TIMESTAMPS — fix chunk-relative → global timestamps
-  8. STITCH    — Gemini unification (skipped for single-chunk jobs)
-  9. COMPLETE  — emit JobCompleteEvent and return result
+  4. PER-CHUNK VERTICAL PIPELINE — each chunk runs Transcribe → Quality →
+                 Retry → Timestamp fix concurrently as one isolated task
+  5. STITCH    — Claude unification (skipped for single-chunk jobs)
+  6. COMPLETE  — emit JobCompleteEvent and return result
 
 A heartbeat task runs during Stage 4 to prevent frontend frozen-UI.
 All temp files are cleaned up in a `finally` block — guaranteed.
@@ -24,9 +22,8 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import structlog
 
@@ -65,7 +62,7 @@ from aurascript.models.events import (
     ProgressHeartbeatEvent,
     StitchingStartedEvent,
 )
-from aurascript.services.audio_processor import AudioProcessingError, analyze_audio, chunk_audio
+from aurascript.services.audio_processor import AudioProcessingError, analyze_audio, stream_chunk_audio
 from aurascript.services.event_bus import EventBus
 from aurascript.utils.cleanup import cleanup_job_files
 from aurascript.utils.timestamp_math import fix_chunk_timestamps
@@ -141,6 +138,172 @@ class OrchestratorAgent(BaseAgent):
         self._chunks_done: int = 0
         self._total_chunks: int = 0
 
+    async def _process_single_chunk_pipeline(
+        self,
+        chunk_path: Path,
+        chunk_index: int,
+        total_chunks: int,
+        input_data: OrchestratorInput,
+        semaphore: asyncio.Semaphore,
+    ) -> CorrectedChunk:
+        """
+        Handles the full vertical pipeline for a single chunk:
+        Transcribe → Quality Check → Retry → Timestamp Fix.
+
+        Never raises — all exceptions are caught and a fallback CorrectedChunk
+        is returned so one bad chunk never crashes the whole job.
+        """
+        _fallback_qual = QualityOutput(
+            final_score=0.5, heuristic_score=0.5,
+            recommendation="accept", issues=[],
+        )
+
+        def _fallback_chunk(transcript: str, qual: QualityOutput) -> CorrectedChunk:
+            corrected = fix_chunk_timestamps(
+                transcript, chunk_index, self.settings.CHUNK_DURATION_SECONDS
+            )
+            return CorrectedChunk(
+                chunk_index=chunk_index,
+                transcript=corrected,
+                quality_output=qual,
+                start_time_seconds=float(
+                    chunk_index * self.settings.CHUNK_DURATION_SECONDS
+                ),
+                detected_languages=["unknown"],
+            )
+
+        # ── Step 1: Transcribe ────────────────────────────────────────────────
+        try:
+            trans_out = await TranscriptionAgent(
+                self.job_id, self.event_bus, self.settings
+            ).run(
+                TranscriptionInput(
+                    chunk_path=chunk_path,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    language_hint=input_data.language_hint,
+                    num_speakers=input_data.num_speakers,
+                ),
+                semaphore=semaphore,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "chunk_transcription_failed", chunk_index=chunk_index, error=str(exc)
+            )
+            self._chunks_done += 1
+            return _fallback_chunk(
+                f"[TRANSCRIPTION_ERROR: chunk {chunk_index} failed]",
+                QualityOutput(
+                    final_score=0.0, heuristic_score=0.0,
+                    recommendation="flag", issues=["agent_exception"],
+                ),
+            )
+
+        self._chunks_done += 1
+
+        # ── Step 2: Quality Check ─────────────────────────────────────────────
+        try:
+            qual_out = await QualityAgent(
+                self.job_id, self.event_bus, self.settings
+            ).run(
+                QualityInput(
+                    transcript=trans_out.transcript,
+                    chunk_index=chunk_index,
+                    transcription_metadata=trans_out.metadata,
+                )
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "quality_check_exception", chunk_index=chunk_index, error=str(exc)
+            )
+            corrected = fix_chunk_timestamps(
+                trans_out.transcript, chunk_index, self.settings.CHUNK_DURATION_SECONDS
+            )
+            return CorrectedChunk(
+                chunk_index=chunk_index,
+                transcript=corrected,
+                quality_output=_fallback_qual,
+                start_time_seconds=float(
+                    chunk_index * self.settings.CHUNK_DURATION_SECONDS
+                ),
+                detected_languages=trans_out.metadata.detected_languages,
+            )
+
+        # ── Step 3: Retry if recommended ──────────────────────────────────────
+        if qual_out.recommendation == "retry":
+            await self.emit(self._make_event(
+                ChunkRetryEvent,
+                chunk_index=chunk_index,
+                reason=", ".join(qual_out.issues),
+            ))
+            try:
+                retry_out = await TranscriptionAgent(
+                    self.job_id, self.event_bus, self.settings
+                ).run(
+                    TranscriptionInput(
+                        chunk_path=chunk_path,
+                        chunk_index=chunk_index,
+                        total_chunks=total_chunks,
+                        language_hint=input_data.language_hint,
+                        num_speakers=input_data.num_speakers,
+                    ),
+                    semaphore=semaphore,
+                    is_retry=True,
+                )
+                retry_qual = await QualityAgent(
+                    self.job_id, self.event_bus, self.settings
+                ).run(
+                    QualityInput(
+                        transcript=retry_out.transcript,
+                        chunk_index=chunk_index,
+                        transcription_metadata=retry_out.metadata,
+                    )
+                )
+                low = retry_qual.final_score < self.settings.LOW_CONFIDENCE_THRESHOLD
+                final_text = (
+                    f"⚠️ [LOW CONFIDENCE SECTION]\n{retry_out.transcript}"
+                    if low else retry_out.transcript
+                )
+                corrected = fix_chunk_timestamps(
+                    final_text, chunk_index, self.settings.CHUNK_DURATION_SECONDS
+                )
+                return CorrectedChunk(
+                    chunk_index=chunk_index,
+                    transcript=corrected,
+                    quality_output=retry_qual,
+                    start_time_seconds=float(
+                        chunk_index * self.settings.CHUNK_DURATION_SECONDS
+                    ),
+                    detected_languages=retry_out.metadata.detected_languages,
+                )
+            except Exception as retry_exc:
+                self.logger.error(
+                    "chunk_retry_failed", chunk_index=chunk_index, error=str(retry_exc)
+                )
+                return _fallback_chunk(
+                    f"⚠️ [LOW CONFIDENCE SECTION]\n{trans_out.transcript}",
+                    qual_out,
+                )
+
+        # ── Step 4: Timestamp Correction ──────────────────────────────────────
+        if qual_out.recommendation == "flag":
+            final_text = f"⚠️ [LOW CONFIDENCE SECTION]\n{trans_out.transcript}"
+        else:
+            final_text = trans_out.transcript
+
+        corrected = fix_chunk_timestamps(
+            final_text, chunk_index, self.settings.CHUNK_DURATION_SECONDS
+        )
+        return CorrectedChunk(
+            chunk_index=chunk_index,
+            transcript=corrected,
+            quality_output=qual_out,
+            start_time_seconds=float(
+                chunk_index * self.settings.CHUNK_DURATION_SECONDS
+            ),
+            detected_languages=trans_out.metadata.detected_languages,
+        )
+
     async def run(self, input: OrchestratorInput) -> OrchestratorOutput:
         job_start = time.monotonic()
         all_file_paths: list[Path] = [input.audio_path]
@@ -195,202 +358,91 @@ class OrchestratorAgent(BaseAgent):
                 estimated_duration_seconds=round(estimated_minutes * 60, 1),
             ))
 
-            # ── STAGE 3: CHUNK ────────────────────────────────────────────────
+            # ── STAGE 3 + 4: STREAM CHUNKS & SPAWN VERTICAL PIPELINES ────────
+            # ffmpeg writes each closed chunk filename to a CSV list file the
+            # instant it is safe to read.  We tail that file and immediately
+            # spawn a full Transcribe → Quality → Retry → Timestamp pipeline
+            # task per chunk — transcription starts before ffmpeg has finished
+            # splitting the file.
             self._current_progress = 10.0
             await self.emit(self._make_event(ChunkingStartedEvent))
 
-            chunk_paths = await chunk_audio(
-                input.audio_path, self.job_id, analysis
+            semaphore = asyncio.Semaphore(self.settings.MAX_CONCURRENT_GEMINI_CALLS)
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop("TRANSCRIBING", job_start)
             )
-            all_file_paths.extend(chunk_paths)
-            total_chunks = len(chunk_paths)
+
+            pipeline_tasks: list[asyncio.Task] = []
+            chunk_index = 0
+
+            async for chunk_path in stream_chunk_audio(
+                input.audio_path, self.job_id, analysis
+            ):
+                all_file_paths.append(chunk_path)
+                pipeline_tasks.append(asyncio.create_task(
+                    self._process_single_chunk_pipeline(
+                        chunk_path=chunk_path,
+                        chunk_index=chunk_index,
+                        total_chunks=estimated_chunks,  # from Stage 2 plan
+                        input_data=input,
+                        semaphore=semaphore,
+                    )
+                ))
+                chunk_index += 1
+
+            # Generator exhausted = ffmpeg has finished writing all chunks.
+            total_chunks = chunk_index
             self._total_chunks = total_chunks
+            self._current_progress = 15.0
 
             await self.emit(self._make_event(
                 ChunkingCompleteEvent,
                 chunk_count=total_chunks,
             ))
 
-            # ── STAGE 4: TRANSCRIBE (PARALLEL) ───────────────────────────────
-            self._current_progress = 15.0
-            semaphore = asyncio.Semaphore(self.settings.MAX_CONCURRENT_GEMINI_CALLS)
+            # Add the CSV list file to cleanup.
+            list_file = self.settings.CHUNKS_DIR / self.job_id / "chunk_list.csv"
+            if list_file.exists():
+                all_file_paths.append(list_file)
 
-            heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop("TRANSCRIBING", job_start)
-            )
+            raw_results = await asyncio.gather(*pipeline_tasks, return_exceptions=True)
 
-            async def _transcribe_tracked(path: Path, i: int) -> TranscriptionOutput:
-                result = await TranscriptionAgent(
-                    self.job_id, self.event_bus, self.settings
-                ).run(
-                    TranscriptionInput(
-                        chunk_path=path,
-                        chunk_index=i,
-                        total_chunks=total_chunks,
-                        language_hint=input.language_hint,
-                        num_speakers=input.num_speakers,
-                    ),
-                    semaphore=semaphore,
-                )
-                self._chunks_done += 1
-                return result
-
-            raw_results = await asyncio.gather(
-                *[_transcribe_tracked(path, i) for i, path in enumerate(chunk_paths)],
-                return_exceptions=True,
-            )
-            heartbeat_task.cancel()
-
-            # Resolve partial failures — never let one bad chunk crash the job.
-            transcription_outputs: list[TranscriptionOutput] = []
+            # Safety net for any unexpected top-level exception.
+            corrected_chunks: list[CorrectedChunk] = []
             for i, result in enumerate(raw_results):
                 if isinstance(result, Exception):
                     self.logger.error(
-                        "chunk_transcription_failed",
-                        chunk_index=i,
-                        error=str(result),
+                        "chunk_pipeline_failed", chunk_index=i, error=str(result)
                     )
-                    transcription_outputs.append(TranscriptionOutput(
-                        transcript=f"[TRANSCRIPTION_ERROR: chunk {i} failed]",
-                        metadata=TranscriptionMetadata(
-                            detected_languages=["unknown"],
-                            speaker_count=input.num_speakers,
-                            confidence=0.0,
-                            issues=["agent_exception"],
-                        ),
+                    corrected_chunks.append(CorrectedChunk(
                         chunk_index=i,
+                        transcript=f"[TRANSCRIPTION_ERROR: chunk {i} failed]",
+                        quality_output=QualityOutput(
+                            final_score=0.0, heuristic_score=0.0,
+                            recommendation="flag", issues=["agent_exception"],
+                        ),
+                        start_time_seconds=float(
+                            i * self.settings.CHUNK_DURATION_SECONDS
+                        ),
+                        detected_languages=["unknown"],
                     ))
                 else:
-                    transcription_outputs.append(result)
+                    corrected_chunks.append(result)
 
-            # gather() does not guarantee order — sort by chunk_index.
-            transcription_outputs.sort(key=lambda x: x.chunk_index)
+            corrected_chunks.sort(key=lambda c: c.chunk_index)
 
-            # ── STAGE 5: QUALITY CHECK (PARALLEL) ────────────────────────────
-            self._current_progress = 70.0
-            quality_tasks = [
-                QualityAgent(self.job_id, self.event_bus, self.settings).run(
-                    QualityInput(
-                        transcript=output.transcript,
-                        chunk_index=output.chunk_index,
-                        transcription_metadata=output.metadata,
-                    )
-                )
-                for output in transcription_outputs
-            ]
-            quality_results = await asyncio.gather(
-                *quality_tasks, return_exceptions=True
-            )
-
-            # ── STAGE 6: RETRY LOGIC ──────────────────────────────────────────
-            self._current_progress = 80.0
-            final_transcripts: list[str] = []
-            low_confidence_indexes: list[int] = []
-
-            for output, quality in zip(transcription_outputs, quality_results):
-                i = output.chunk_index
-
-                if isinstance(quality, Exception):
-                    # Quality check itself failed — accept the transcript as-is.
-                    self.logger.warning(
-                        "quality_check_exception", chunk_index=i, error=str(quality)
-                    )
-                    final_transcripts.append(output.transcript)
-                    continue
-
-                if quality.recommendation == "retry":
-                    await self.emit(self._make_event(
-                        ChunkRetryEvent,
-                        chunk_index=i,
-                        reason=", ".join(quality.issues),
-                    ))
-
-                    try:
-                        retry_output = await TranscriptionAgent(
-                            self.job_id, self.event_bus, self.settings
-                        ).run(
-                            TranscriptionInput(
-                                chunk_path=chunk_paths[i],
-                                chunk_index=i,
-                                total_chunks=total_chunks,
-                                language_hint=input.language_hint,
-                                num_speakers=input.num_speakers,
-                            ),
-                            semaphore=semaphore,
-                            is_retry=True,
-                        )
-
-                        retry_quality = await QualityAgent(
-                            self.job_id, self.event_bus, self.settings
-                        ).run(
-                            QualityInput(
-                                transcript=retry_output.transcript,
-                                chunk_index=i,
-                                transcription_metadata=retry_output.metadata,
-                            )
-                        )
-
-                        if retry_quality.final_score >= self.settings.LOW_CONFIDENCE_THRESHOLD:
-                            final_transcripts.append(retry_output.transcript)
-                        else:
-                            low_confidence_indexes.append(i)
-                            final_transcripts.append(
-                                f"⚠️ [LOW CONFIDENCE SECTION]\n{retry_output.transcript}"
-                            )
-                    except Exception as retry_exc:
-                        self.logger.error(
-                            "chunk_retry_failed", chunk_index=i, error=str(retry_exc)
-                        )
-                        low_confidence_indexes.append(i)
-                        final_transcripts.append(
-                            f"⚠️ [LOW CONFIDENCE SECTION]\n{output.transcript}"
-                        )
-
-                elif quality.recommendation == "flag":
-                    low_confidence_indexes.append(i)
-                    final_transcripts.append(
-                        f"⚠️ [LOW CONFIDENCE SECTION]\n{output.transcript}"
-                    )
-
-                else:  # "accept"
-                    final_transcripts.append(output.transcript)
-
-            # ── STAGE 7: TIMESTAMP CORRECTION ────────────────────────────────
-            self._current_progress = 88.0
-            corrected_transcripts = [
-                fix_chunk_timestamps(
-                    t, i, self.settings.CHUNK_DURATION_SECONDS
-                )
-                for i, t in enumerate(final_transcripts)
+            low_confidence_indexes = [
+                c.chunk_index for c in corrected_chunks
+                if c.quality_output.final_score < self.settings.LOW_CONFIDENCE_THRESHOLD
             ]
 
-            # Build corrected chunk list for stitcher.
-            corrected_chunks = [
-                CorrectedChunk(
-                    chunk_index=output.chunk_index,
-                    transcript=corrected_transcripts[output.chunk_index],
-                    quality_output=quality if not isinstance(quality, Exception)
-                    else QualityOutput(
-                        final_score=0.5, heuristic_score=0.5,
-                        recommendation="accept", issues=[],
-                    ),
-                    start_time_seconds=float(
-                        output.chunk_index * self.settings.CHUNK_DURATION_SECONDS
-                    ),
-                    detected_languages=output.metadata.detected_languages,
-                )
-                for output, quality in zip(transcription_outputs, quality_results)
-            ]
-
-            # ── STAGE 8: STITCH ───────────────────────────────────────────────
+            # ── STAGE 5: STITCH ───────────────────────────────────────────────
             self._current_progress = 92.0
 
-            if len(corrected_transcripts) == 1:
-                final_transcript = corrected_transcripts[0]
+            if len(corrected_chunks) == 1:
+                final_transcript = corrected_chunks[0].transcript
                 speaker_map: dict[str, str] = {}
-                languages_detected = (
-                    transcription_outputs[0].metadata.detected_languages
-                )
+                languages_detected = corrected_chunks[0].detected_languages
                 word_count = len(final_transcript.split())
 
                 await self.emit(self._make_event(
@@ -418,12 +470,13 @@ class OrchestratorAgent(BaseAgent):
                 languages_detected = stitch_output.languages_detected
                 word_count = stitch_output.word_count
 
-            # ── STAGE 9: COMPLETE ─────────────────────────────────────────────
+            # ── STAGE 6: COMPLETE ─────────────────────────────────────────────
+            heartbeat_task.cancel()
             self._current_progress = 100.0
             processing_seconds = time.monotonic() - job_start
             overall_confidence = sum(
-                o.metadata.confidence for o in transcription_outputs
-            ) / len(transcription_outputs)
+                c.quality_output.final_score for c in corrected_chunks
+            ) / len(corrected_chunks)
 
             await self.emit(self._make_event(
                 JobCompleteEvent,

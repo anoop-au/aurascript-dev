@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     # Audio is split into chunks of this duration before sending to Gemini.
     CHUNK_DURATION_SECONDS: Annotated[int, Field(ge=10, le=600)] = 180
     # asyncio.Semaphore limit for concurrent Gemini API calls.
-    MAX_CONCURRENT_GEMINI_CALLS: Annotated[int, Field(ge=1, le=20)] = 5
+    MAX_CONCURRENT_GEMINI_CALLS: Annotated[int, Field(ge=1, le=50)] = 24
     # Reject audio files longer than this. Protects cost + memory.
     MAX_AUDIO_DURATION_SECONDS: Annotated[int, Field(ge=60)] = 7200
     # Quality scores below this trigger an automatic retry.
