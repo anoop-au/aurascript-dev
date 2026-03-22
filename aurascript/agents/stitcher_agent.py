@@ -59,6 +59,11 @@ Find all [cut-off] markers. Look at the adjacent chunk for context.
 If you can reconstruct the word with confidence, provide the replacement text.
 If not, use [inaudible].
 
+TASK 3: OUTPUT CLEANUP
+If you see [overlap] tags, ensure the dialogue flows logically.
+If two speakers are talking over each other, separate them into two
+distinct timestamped lines — one per speaker.
+
 OUTPUT FORMAT — respond with ONLY this JSON, no other text:
 {{
   "speaker_assignments": [

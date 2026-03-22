@@ -1,15 +1,15 @@
 """
 AuraScript — TranscriptionAgent.
 
-Sends a single audio chunk to Gemini 2.0 Flash via Vertex AI and parses
-the structured transcript + metadata block from the response.
+Sends a single audio chunk to Gemini 2.0 Flash via Vertex AI and returns
+a structured transcript + metadata using native JSON schema output.
 
 Key design decisions:
 - temperature=0.0 for deterministic, accurate output.
 - BLOCK_NONE safety settings — transcription of real conversations requires
   unfiltered output (slang, profanity, sensitive topics all appear in audio).
 - Tenacity retry on transient Google API errors (rate limits, timeouts).
-- Metadata block parsed with regex; parse failure is logged but never crashes.
+- response_schema=GeminiChunkResponse guarantees valid JSON — no regex needed.
 - is_retry=True adds an explicit instruction to the prompt telling Gemini
   that a previous attempt was flagged for quality issues.
 """
@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
+
+from pydantic import BaseModel
 
 import structlog
 from tenacity import (
@@ -67,6 +66,16 @@ from aurascript.models.events import (
 from aurascript.services.event_bus import EventBus
 
 logger = structlog.get_logger(__name__)
+
+
+class GeminiChunkResponse(BaseModel):
+    """Strict schema Gemini must return for each audio chunk."""
+    transcript: str
+    detected_languages: list[str]
+    speaker_count: int
+    confidence: float
+    issues: list[str]
+
 
 # Verbatim system prompt — do NOT alter. This is the 97% accuracy prompt.
 _SYSTEM_PROMPT_TEMPLATE = """\
@@ -115,13 +124,19 @@ YOUR ABSOLUTE RULES:
    [background: description] — e.g. [background: loud traffic]
    [laughter], [pause], [crosstalk]
 
-7. METADATA BLOCK (MANDATORY — append to EVERY response)
-   ---METADATA---
-   detected_languages: [comma-separated list]
-   speaker_count: <integer>
-   confidence: <float 0.0-1.0>
-   issues: [comma-separated: audio_cutoff|noise|overlap|low_quality|none]
-   ---END METADATA---
+7. MALAYALAM SCRIPT RULES
+   When transcribing Malayalam, use proper Malayalam script (മലയാളം).
+   Do NOT use English letters (Manglish spelling) for Malayalam words
+   unless the speaker is explicitly spelling something out.
+   Ensure correct usage of chillaksharam (ൽ, ൾ, ൺ, ൻ, ർ).
+
+8. OUTPUT FORMAT (MANDATORY)
+   Return a single JSON object with these exact fields:
+   - "transcript": the full verbatim transcript text (string)
+   - "detected_languages": list of language names spoken (e.g. ["English", "Mandarin"])
+   - "speaker_count": number of distinct speakers detected (integer)
+   - "confidence": transcription confidence 0.0–1.0 (float)
+   - "issues": list of issues from [audio_cutoff, noise, overlap, low_quality] — empty list if none
 
 {language_hint_instruction}
 Expected speakers in this chunk: {num_speakers}
@@ -131,17 +146,6 @@ _RETRY_PROMPT_SUFFIX = (
     "\n\nIMPORTANT: A previous transcription attempt for this chunk was "
     "flagged for quality issues. Please transcribe with extra care, paying "
     "special attention to speaker identification and verbatim accuracy."
-)
-
-# Metadata block regex — lenient to handle minor model formatting variations.
-_METADATA_RE = re.compile(
-    r"---METADATA---\s*"
-    r"detected_languages:\s*(?P<langs>[^\n]+)\s*"
-    r"speaker_count:\s*(?P<speaker_count>\d+)\s*"
-    r"confidence:\s*(?P<confidence>[\d.]+)\s*"
-    r"issues:\s*(?P<issues>[^\n]+)\s*"
-    r"---END METADATA---",
-    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -163,57 +167,6 @@ def _build_system_prompt(
     if is_retry:
         prompt += _RETRY_PROMPT_SUFFIX
     return prompt
-
-
-def _parse_metadata(response_text: str) -> tuple[str, TranscriptionMetadata]:
-    """
-    Extract the ---METADATA--- block from the model response.
-
-    Returns (transcript_text, metadata). On any parse failure, returns the
-    full response as transcript and a safe default metadata object.
-    Never raises.
-    """
-    match = _METADATA_RE.search(response_text)
-    if not match:
-        logger.warning("metadata_parse_failed", response_preview=response_text[:200])
-        transcript = response_text.strip()
-        return transcript, TranscriptionMetadata(
-            detected_languages=["unknown"],
-            speaker_count=1,
-            confidence=0.5,
-            issues=["metadata_parse_failed"],
-        )
-
-    # Transcript is everything before the metadata block.
-    transcript = response_text[: match.start()].strip()
-
-    try:
-        langs_raw = match.group("langs").strip().strip("[]")
-        detected_languages = [
-            l.strip() for l in langs_raw.split(",") if l.strip()
-        ] or ["unknown"]
-        speaker_count = int(match.group("speaker_count"))
-        confidence = max(0.0, min(1.0, float(match.group("confidence"))))
-        issues_raw = match.group("issues").strip().strip("[]")
-        issues = [
-            i.strip() for i in issues_raw.split(",")
-            if i.strip() and i.strip().lower() != "none"
-        ]
-    except (ValueError, AttributeError) as exc:
-        logger.warning("metadata_field_parse_failed", error=str(exc))
-        return transcript, TranscriptionMetadata(
-            detected_languages=["unknown"],
-            speaker_count=1,
-            confidence=0.5,
-            issues=["metadata_parse_failed"],
-        )
-
-    return transcript, TranscriptionMetadata(
-        detected_languages=detected_languages,
-        speaker_count=speaker_count,
-        confidence=confidence,
-        issues=issues,
-    )
 
 
 class TranscriptionAgent(BaseAgent):
@@ -317,6 +270,8 @@ class TranscriptionAgent(BaseAgent):
                 temperature=0.0,        # Deterministic — critical for accuracy
                 max_output_tokens=8192,
                 top_p=1.0,
+                response_mime_type="application/json",
+                response_schema=GeminiChunkResponse,
                 safety_settings=[
                     genai_types.SafetySetting(
                         category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
@@ -334,11 +289,15 @@ class TranscriptionAgent(BaseAgent):
             ),
         )
 
-        raw_text = response.text
-        transcript, metadata = _parse_metadata(raw_text)
+        parsed = GeminiChunkResponse.model_validate_json(response.text)
 
         return TranscriptionOutput(
-            transcript=transcript,
-            metadata=metadata,
+            transcript=parsed.transcript,
+            metadata=TranscriptionMetadata(
+                detected_languages=parsed.detected_languages or ["unknown"],
+                speaker_count=parsed.speaker_count,
+                confidence=max(0.0, min(1.0, parsed.confidence)),
+                issues=parsed.issues,
+            ),
             chunk_index=input.chunk_index,
         )
