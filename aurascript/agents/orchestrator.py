@@ -455,20 +455,32 @@ class OrchestratorAgent(BaseAgent):
             else:
                 await self.emit(self._make_event(StitchingStartedEvent))
 
-                stitch_input = StitcherInput(
-                    corrected_chunks=corrected_chunks,
-                    low_confidence_indexes=low_confidence_indexes,
-                    num_speakers=input.num_speakers,
-                    total_duration_seconds=analysis.duration_seconds,
-                )
-                stitch_output = await StitcherAgent(
-                    self.job_id, self.event_bus, self.settings
-                ).run(stitch_input)
+                # Process chunks sequentially, rolling the speaker map forward
+                # so each chunk receives the speaker context from all prior chunks.
+                context_speaker_map: dict[str, str] = {}
+                all_transcripts: list[str] = []
+                all_languages: set[str] = set()
 
-                final_transcript = stitch_output.transcript
-                speaker_map = stitch_output.speaker_map
-                languages_detected = stitch_output.languages_detected
-                word_count = stitch_output.word_count
+                for chunk in corrected_chunks:
+                    stitch_input = StitcherInput(
+                        corrected_chunks=[chunk],
+                        low_confidence_indexes=low_confidence_indexes,
+                        num_speakers=input.num_speakers,
+                        total_duration_seconds=analysis.duration_seconds,
+                        previous_chunk_speakers=dict(context_speaker_map),
+                    )
+                    stitch_output = await StitcherAgent(
+                        self.job_id, self.event_bus, self.settings
+                    ).run(stitch_input)
+
+                    all_transcripts.append(stitch_output.transcript)
+                    context_speaker_map.update(stitch_output.speaker_map)
+                    all_languages.update(stitch_output.languages_detected)
+
+                final_transcript = "\n".join(all_transcripts)
+                speaker_map = context_speaker_map
+                languages_detected = sorted(all_languages - {"unknown"}) or ["unknown"]
+                word_count = len(final_transcript.split())
 
             # ── STAGE 6: COMPLETE ─────────────────────────────────────────────
             heartbeat_task.cancel()

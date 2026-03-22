@@ -105,6 +105,7 @@ class StitcherInput:
     low_confidence_indexes: list[int]
     num_speakers: int
     total_duration_seconds: float
+    previous_chunk_speakers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

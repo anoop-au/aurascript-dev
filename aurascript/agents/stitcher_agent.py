@@ -1,16 +1,18 @@
 """
-AuraScript — StitcherAgent (Map-Reduce / Metadata-only).
+AuraScript — StitcherAgent (per-chunk with rolling speaker context).
 
-The LLM is asked only for a small JSON correction payload:
-  - speaker_assignments: maps per-chunk local labels → global labels
-  - boundary_fixes: targeted [cut-off] repairs
-  - languages_detected
+Processes chunks sequentially, passing the accumulated speaker map forward
+as context so Claude can maintain consistent speaker labels across boundaries.
 
-All text manipulation (label substitution, boundary repair, concatenation)
-is done in Python — the LLM never rewrites the full transcript.
+Each chunk gets its own Claude call with:
+  - The chunk transcript
+  - The speaker registry built from all previous chunks
 
-On JSON parse failure the agent falls back to concatenated raw chunks so the
-pipeline never crashes.
+All text manipulation (label substitution, boundary repair) is done in
+Python — the LLM outputs only a small JSON correction payload.
+
+On JSON parse failure the agent falls back to the raw chunk transcript so
+the pipeline never crashes.
 """
 
 from __future__ import annotations
@@ -39,91 +41,77 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _STITCH_SYSTEM_PROMPT = """\
-You are AuraScript's transcript unification engine.
+You are AuraScript's expert diarization and transcript unification engine.
 
-INPUT: A Manglish transcript assembled from sequential audio chunks.
-Each chunk is prefixed with its index: === CHUNK N ===
+CONTEXT FROM PREVIOUS CHUNKS:
+{previous_context}
+
+INPUT: A single Manglish audio chunk transcript.
 Chunks marked ⚠️ LOW CONFIDENCE were flagged during quality checks — treat with caution.
-Each chunk (except the first) is preceded by a "--- Speaker Bridge ---" section showing
-the last 3 speaker turns of the previous chunk. Use this to maintain speaker continuity.
 
 YOUR TASKS:
 
-TASK 1: GLOBAL SPEAKER UNIFICATION — SPEAKER REGISTRY
-You must maintain a Speaker Registry as you process each chunk in order.
+TASK 1: SPEAKER CONTINUITY
+Using the context above, assign globally consistent labels to every speaker in this chunk.
 Rules:
-- Start with an empty registry. When you first encounter a voice in Chunk 0, assign
-  them "Speaker 1", the next new voice "Speaker 2", etc.
-- For each subsequent chunk, consult the Speaker Bridge. If a local label (e.g.
-  "Speaker B" in Chunk 2) matches the same voice as a speaker already in your
-  registry, map them to that existing global label.
-- If a genuinely new voice appears that was not in any previous chunk, assign the
-  next sequential number.
+- If a voice in this chunk matches a speaker already listed in the context, you MUST
+  use the same global label (e.g. Speaker 1, Speaker 2).
+- If a genuinely new voice appears that was not in the context, assign the next
+  sequential number (e.g. if context has Speaker 1 and Speaker 2, assign Speaker 3).
 - Assign a numbered global label to EVERY local label — never leave any speaker
-  unassigned.
+  unassigned. Do NOT use "Speaker ?".
 
 TASK 2: BOUNDARY WORD REPAIR
-Find all [cut-off] markers. Look at the adjacent chunk for context.
-If you can reconstruct the word with confidence, provide the replacement text.
-If not, use [inaudible].
+Find all [cut-off] markers. If you can reconstruct the word with confidence from
+context, provide the replacement. Otherwise use [inaudible].
 
 TASK 3: OUTPUT CLEANUP
-If you see [overlap] tags, ensure the dialogue flows logically.
-If two speakers are talking over each other, separate them into two
-distinct timestamped lines — one per speaker.
+If you see [overlap] tags, separate overlapping speakers into two distinct
+timestamped lines — one per speaker.
 
 OUTPUT FORMAT — respond with ONLY this JSON, no other text:
 {{
   "speaker_assignments": [
-    {{"chunk_index": 0, "local": "Speaker A", "global": "Speaker 1"}},
-    {{"chunk_index": 1, "local": "Speaker B", "global": "Speaker 1"}}
+    {{"chunk_index": {chunk_index}, "local": "Speaker A", "global": "Speaker 1"}},
+    {{"chunk_index": {chunk_index}, "local": "Speaker B", "global": "Speaker 2"}}
   ],
   "boundary_fixes": [
-    {{"chunk_index": 1, "original": "[cut-off]", "replacement": "complete_word"}}
+    {{"chunk_index": {chunk_index}, "original": "[cut-off]", "replacement": "complete_word"}}
   ],
   "languages_detected": ["English", "Malayalam"]
 }}
 
 If there are no boundary fixes needed, output an empty array for boundary_fixes.
-Expected number of unique speakers: {num_speakers}
+Expected number of unique speakers across the entire conversation: {num_speakers}
 """
+
+_NO_PREVIOUS_CONTEXT = (
+    "No previous context — this is the first chunk. "
+    "Assign Speaker 1 to the first voice you encounter, Speaker 2 to the next, etc."
+)
+
+
+def _format_previous_context(speaker_map: dict[str, str]) -> str:
+    """Format the accumulated speaker map into a readable context string."""
+    if not speaker_map:
+        return _NO_PREVIOUS_CONTEXT
+    lines = [f"- {label}: known speaker" for label in sorted(speaker_map.keys())]
+    return "Known speakers from previous chunks:\n" + "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Input builder
 # ---------------------------------------------------------------------------
 
 
-def _extract_speaker_tail(transcript: str, n_lines: int = 3) -> str:
-    """Return the last n timestamped speaker turns from a chunk transcript."""
-    lines = [
-        line.strip() for line in transcript.splitlines()
-        if re.match(r"\[\d{2}:\d{2}\]", line.strip())
-    ]
-    return "\n".join(lines[-n_lines:]) if lines else ""
-
-
 def _build_stitcher_input_text(stitch_input: StitcherInput) -> str:
     """
-    Assemble the transcript text to send to the LLM.
-
-    Each chunk is prefixed with its index marker. From chunk 1 onwards, a
-    Speaker Bridge section shows the last 3 turns of the previous chunk so
-    Claude can resolve speaker identity across boundaries.
+    Build the user message for a single-chunk stitcher call.
     """
-    chunks = stitch_input.corrected_chunks
-    parts: list[str] = []
-    for i, chunk in enumerate(chunks):
-        # Inject speaker bridge from the previous chunk's tail.
-        if i > 0:
-            tail = _extract_speaker_tail(chunks[i - 1].transcript)
-            if tail:
-                parts.append(
-                    f"--- Speaker Bridge (last turns of Chunk {i - 1}) ---\n{tail}"
-                )
-        is_low_confidence = chunk.chunk_index in stitch_input.low_confidence_indexes
-        warning = "⚠️ LOW CONFIDENCE — treat with caution\n" if is_low_confidence else ""
-        parts.append(f"=== CHUNK {chunk.chunk_index} ===\n{warning}{chunk.transcript}")
-    return "\n\n".join(parts)
+    chunk = stitch_input.corrected_chunks[0]
+    is_low_confidence = chunk.chunk_index in stitch_input.low_confidence_indexes
+    warning = "⚠️ LOW CONFIDENCE — treat with caution\n" if is_low_confidence else ""
+    return f"=== CHUNK {chunk.chunk_index} ===\n{warning}{chunk.transcript}"
 
 
 # ---------------------------------------------------------------------------
@@ -137,52 +125,41 @@ def _apply_corrections(
     boundary_fixes: list[dict],
 ) -> str:
     """
-    Apply LLM-provided corrections to the raw chunk transcripts in Python.
+    Apply LLM-provided corrections to the chunk transcript in Python.
 
-    1. Per-chunk speaker label substitution  (local → global)
-    2. Per-chunk boundary word repair        ([cut-off] → completion)
-    3. Concatenate all chunks into one transcript
+    1. Speaker label substitution  (local → global)
+    2. Boundary word repair        ([cut-off] → completion)
     """
-    # Build (chunk_index, local_label) → global_label lookup.
-    speaker_lookup: dict[tuple[int, str], str] = {}
+    chunk = stitch_input.corrected_chunks[0]
+    chunk_index = chunk.chunk_index
+    text = chunk.transcript
+
+    # Build local → global lookup for this chunk.
+    speaker_lookup: dict[str, str] = {}
     for assignment in speaker_assignments:
         try:
-            key = (int(assignment["chunk_index"]), str(assignment["local"]))
-            speaker_lookup[key] = str(assignment["global"])
+            if int(assignment["chunk_index"]) == chunk_index:
+                speaker_lookup[str(assignment["local"])] = str(assignment["global"])
         except (KeyError, ValueError, TypeError):
             continue
 
-    # Build chunk_index → [(original, replacement)] lookup.
-    fix_lookup: dict[int, list[tuple[str, str]]] = {}
+    # Replace local speaker labels.
+    local_labels_found = set(re.findall(r"\[Speaker ([^\]]+)\]", text))
+    for label_body in local_labels_found:
+        local_label = f"Speaker {label_body}"
+        global_label = speaker_lookup.get(local_label)
+        if global_label:
+            text = text.replace(f"[{local_label}]", f"[{global_label}]")
+
+    # Apply boundary fixes (first occurrence each).
     for fix in boundary_fixes:
         try:
-            idx = int(fix["chunk_index"])
-            fix_lookup.setdefault(idx, []).append(
-                (str(fix["original"]), str(fix["replacement"]))
-            )
+            if int(fix["chunk_index"]) == chunk_index:
+                text = text.replace(str(fix["original"]), str(fix["replacement"]), 1)
         except (KeyError, ValueError, TypeError):
             continue
 
-    processed: list[str] = []
-    for chunk in stitch_input.corrected_chunks:
-        text = chunk.transcript
-
-        # Replace all local speaker labels for this chunk.
-        # Transcript lines look like: [MM:SS] [Speaker A]: …
-        local_labels_found = set(re.findall(r"\[Speaker ([^\]]+)\]", text))
-        for label_body in local_labels_found:
-            local_label = f"Speaker {label_body}"
-            global_label = speaker_lookup.get((chunk.chunk_index, local_label))
-            if global_label:
-                text = text.replace(f"[{local_label}]", f"[{global_label}]")
-
-        # Apply boundary fixes for this chunk (first occurrence each).
-        for original, replacement in fix_lookup.get(chunk.chunk_index, []):
-            text = text.replace(original, replacement, 1)
-
-        processed.append(text.strip())
-
-    return "\n".join(processed)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +174,9 @@ def _parse_stitch_response(raw: str, stitch_input: StitcherInput) -> StitcherOut
     Three-tier fallback:
     1. Direct json.loads on the full response.
     2. Regex extraction of the first {...} block.
-    3. Plain concatenation of raw chunks — never crashes.
+    3. Raw chunk transcript — never crashes.
     """
-    fallback_transcript = "\n".join(c.transcript for c in stitch_input.corrected_chunks)
+    fallback_transcript = stitch_input.corrected_chunks[0].transcript
 
     def _build_output(data: dict) -> StitcherOutput:
         speaker_assignments = data.get("speaker_assignments", [])
@@ -208,9 +185,8 @@ def _parse_stitch_response(raw: str, stitch_input: StitcherInput) -> StitcherOut
 
         transcript = _apply_corrections(stitch_input, speaker_assignments, boundary_fixes)
 
-        # speaker_map: global_label → "unknown" (descriptions not provided in metadata mode)
         unique_globals = {str(a["global"]) for a in speaker_assignments if "global" in a}
-        speaker_map = {g: "unknown" for g in sorted(unique_globals)}
+        speaker_map = {g: "known" for g in sorted(unique_globals)}
 
         return StitcherOutput(
             transcript=transcript,
@@ -250,9 +226,8 @@ def _parse_stitch_response(raw: str, stitch_input: StitcherInput) -> StitcherOut
 
 class StitcherAgent(BaseAgent):
     """
-    Unifies all chunk transcripts into a single coherent final transcript
-    using a Map-Reduce approach: the LLM outputs only correction metadata,
-    Python applies the corrections.
+    Processes a single chunk with rolling speaker context from previous chunks.
+    Called once per chunk by the orchestrator in sequential order.
     """
 
     def __init__(
@@ -272,41 +247,18 @@ class StitcherAgent(BaseAgent):
         return self._client
 
     async def run(self, input: StitcherInput) -> StitcherOutput:
-        """Send chunks to Claude for metadata, apply corrections in Python."""
-        await self.emit(self._make_event(StitchingStartedEvent))
+        """Process one chunk with accumulated speaker context."""
+        chunk_index = input.corrected_chunks[0].chunk_index
 
+        previous_context = _format_previous_context(input.previous_chunk_speakers)
+        system_prompt = _STITCH_SYSTEM_PROMPT.format(
+            previous_context=previous_context,
+            chunk_index=chunk_index,
+            num_speakers=input.num_speakers,
+        )
         input_text = _build_stitcher_input_text(input)
-        system_prompt = _STITCH_SYSTEM_PROMPT.format(num_speakers=input.num_speakers)
 
-        output = await self._call_claude(system_prompt, input_text, input)
-
-        preview_lines = [
-            line for line in output.transcript.splitlines() if line.strip()
-        ][:5]
-
-        await self.emit(self._make_event(StitchingCompleteEvent))
-        await self.emit(
-            self._make_event(
-                AgentDecisionEvent,
-                agent="StitcherAgent",
-                decision="stitching_complete",
-                reason=(
-                    f"Unified {len(input.corrected_chunks)} chunks, "
-                    f"{len(output.speaker_map)} speakers, "
-                    f"{output.word_count} words, "
-                    f"languages={output.languages_detected}"
-                ),
-            )
-        )
-
-        self.logger.info(
-            "stitching_complete",
-            speakers=len(output.speaker_map),
-            word_count=output.word_count,
-            languages=output.languages_detected,
-        )
-
-        return output
+        return await self._call_claude(system_prompt, input_text, input)
 
     async def _call_claude(
         self,
@@ -315,18 +267,17 @@ class StitcherAgent(BaseAgent):
         stitch_input: StitcherInput,
     ) -> StitcherOutput:
         """
-        Call Claude for correction metadata only (not the full transcript).
-        max_tokens is 2048 — sufficient for JSON metadata on any realistic job.
+        Call Claude for correction metadata for one chunk.
+        max_tokens is 1024 — sufficient for single-chunk JSON metadata.
         Never raises — falls back gracefully on any error.
         """
-        fallback_transcript = "\n".join(
-            c.transcript for c in stitch_input.corrected_chunks
-        )
+        fallback_transcript = stitch_input.corrected_chunks[0].transcript
+        chunk_index = stitch_input.corrected_chunks[0].chunk_index
         try:
             client = self._get_client()
             response = await client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=4096,
+                max_tokens=1024,
                 system=system_prompt,
                 messages=[{"role": "user", "content": input_text}],
                 timeout=60.0,
@@ -335,7 +286,11 @@ class StitcherAgent(BaseAgent):
             return _parse_stitch_response(raw, stitch_input)
 
         except Exception as exc:
-            self.logger.error("stitcher_claude_call_failed", error=str(exc))
+            self.logger.error(
+                "stitcher_claude_call_failed",
+                chunk_index=chunk_index,
+                error=str(exc),
+            )
             return StitcherOutput(
                 transcript=fallback_transcript,
                 speaker_map={},
