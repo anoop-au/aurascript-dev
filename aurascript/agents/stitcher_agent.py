@@ -297,7 +297,7 @@ class StitcherAgent(BaseAgent):
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model="claude-3-5-sonnet-latest",
+                model="claude-sonnet-4-6",
                 max_tokens=2048,
                 system=system_prompt,
                 messages=[{"role": "user", "content": input_text}],
