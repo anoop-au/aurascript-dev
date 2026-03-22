@@ -391,6 +391,22 @@ async def stream_chunk_audio(
     for path in _drain_list_file():
         yield path
 
+    # Wait briefly for the OS filesystem to flush any remaining writes.
+    await asyncio.sleep(2.0)
+
+    # Second drain — picks up entries ffmpeg wrote during the sleep window.
+    for path in _drain_list_file():
+        yield path
+
+    # Absolute failsafe: glob all chunks ffmpeg wrote and yield any that
+    # never appeared in the CSV (e.g. the last chunk on a slow filesystem).
+    all_chunks = sorted(output_dir.glob("chunk_*.mp3"))
+    for chunk in all_chunks:
+        if chunk.name not in yielded:
+            logger.warning("found_orphaned_chunk_via_failsafe", name=chunk.name, job_id=job_id)
+            yielded.add(chunk.name)
+            yield chunk
+
     # Reap the process and collect stderr.
     _, stderr_bytes = await proc.communicate()
 
