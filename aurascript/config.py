@@ -76,11 +76,11 @@ class Settings(BaseSettings):
     # API key from https://aistudio.google.com/app/apikey
     GEMINI_API_KEY: str
     # Model used for per-chunk transcription (Phase 1 of pipeline).
-    VERTEX_AI_MODEL_TRANSCRIBE: str = "gemini-2.5-flash-preview-04-17"
+    VERTEX_AI_MODEL_TRANSCRIBE: str
     # Model used for final transcript unification (Phase 2 of pipeline).
-    VERTEX_AI_MODEL_STITCH: str = "gemini-2.0-flash"
+    VERTEX_AI_MODEL_STITCH: str
     # Model used for quality scoring and retry decisions.
-    VERTEX_AI_MODEL_QUALITY: str = "gemini-2.0-flash"
+    VERTEX_AI_MODEL_QUALITY: str
     # Legacy Vertex AI fields — kept optional for backwards-compatibility.
     GOOGLE_CLOUD_PROJECT: Optional[str] = None
     GOOGLE_CLOUD_LOCATION: Optional[str] = None
