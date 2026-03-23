@@ -194,8 +194,18 @@ def _parse_metadata(response_text: str) -> tuple[str, TranscriptionMetadata]:
             issues=["metadata_missing"],
         )
 
-    parts = response_text.split(_JSON_METADATA_SEPARATOR, 1)
+    parts = response_text.split(_JSON_METADATA_SEPARATOR, maxsplit=1)
     transcript = parts[0].strip()
+
+    if not transcript:
+        # Separator was there but nothing before it — full response is transcript
+        return response_text, TranscriptionMetadata(
+            detected_languages=["unknown"],
+            speaker_count=1,
+            confidence=0.5,
+            issues=["metadata_separator_misplaced"],
+        )
+
     json_str = parts[1].strip()
 
     # Strip markdown code fences if the model accidentally added them.

@@ -116,6 +116,7 @@ class Settings(BaseSettings):
         "audio/x-m4a",
         "audio/ogg",
         "audio/webm",
+        "video/mp4",      # MP4 video (audio extracted during processing)
         "video/webm",     # webm audio recorded via MediaRecorder
         "audio/flac",
         "audio/x-flac",   # browser alias for audio/flac
