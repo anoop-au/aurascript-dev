@@ -74,6 +74,7 @@ class QualityInput:
     transcript: str
     chunk_index: int
     transcription_metadata: TranscriptionMetadata
+    translate_to: str | None = None
 
 
 @dataclass

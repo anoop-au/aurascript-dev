@@ -59,6 +59,24 @@ TRANSCRIPT:
 {transcript}
 """
 
+_AI_QUALITY_PROMPT_TRANSLATED = """\
+Review this transcript chunk for quality. The transcript has been intentionally \
+translated to {translate_to} — do NOT penalize for the use of {translate_to}.
+
+Penalize:
+- Invented words or phrases not plausibly spoken
+- Missing speaker changes
+- Timestamp format errors
+- Signs of hallucination (words that couldn't have been spoken)
+
+Respond in STRICT JSON, no other text:
+{"score": <float 0.0-1.0>, "issues": [<strings>], \
+"recommendation": "<accept|retry|flag>"}
+
+TRANSCRIPT:
+{transcript}
+"""
+
 
 def _compute_heuristic_score(
     transcript: str,
@@ -163,7 +181,7 @@ class QualityAgent(BaseAgent):
                 heuristic_score=round(heuristic_score, 3),
             )
             ai_score, ai_issues, ai_recommendation = await self._ai_validate(
-                input.transcript, input.chunk_index
+                input.transcript, input.chunk_index, input.translate_to
             )
 
         # ── Final score ───────────────────────────────────────────────────────
@@ -234,6 +252,7 @@ class QualityAgent(BaseAgent):
         self,
         transcript: str,
         chunk_index: int,
+        translate_to: str | None = None,
     ) -> tuple[float, list[str], str]:
         """
         Call Gemini to validate the transcript. Returns (score, issues, recommendation).
@@ -245,7 +264,12 @@ class QualityAgent(BaseAgent):
 
         try:
             client = self._get_client()
-            prompt = _AI_QUALITY_PROMPT.format(transcript=transcript[:4000])
+            if translate_to:
+                prompt = _AI_QUALITY_PROMPT_TRANSLATED.format(
+                    translate_to=translate_to, transcript=transcript[:4000]
+                )
+            else:
+                prompt = _AI_QUALITY_PROMPT.format(transcript=transcript[:4000])
 
             response = await client.aio.models.generate_content(
                 model=self.settings.VERTEX_AI_MODEL_QUALITY,

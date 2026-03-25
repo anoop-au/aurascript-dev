@@ -212,6 +212,7 @@ class OrchestratorAgent(BaseAgent):
                     transcript=trans_out.transcript,
                     chunk_index=chunk_index,
                     transcription_metadata=trans_out.metadata,
+                    translate_to=input_data.translate_to,
                 )
             )
         except Exception as exc:
@@ -260,6 +261,7 @@ class OrchestratorAgent(BaseAgent):
                         transcript=retry_out.transcript,
                         chunk_index=chunk_index,
                         transcription_metadata=retry_out.metadata,
+                        translate_to=input_data.translate_to,
                     )
                 )
                 low = retry_qual.final_score < self.settings.LOW_CONFIDENCE_THRESHOLD
