@@ -46,6 +46,9 @@ from aurascript.utils.cleanup import cleanup_job_files
 from aurascript.utils.result_store import load_result
 
 import datetime
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["Transcription"])
 
@@ -76,6 +79,8 @@ async def submit_transcription(
     Returns immediately with a 202 and URLs for WebSocket, polling, and result.
     The actual transcription runs asynchronously in the background.
     """
+    logger.info("transcribe_request_received", language_hint=language_hint, translate_to=translate_to, num_speakers=num_speakers)
+
     # Create job record (also enforces MAX_CONCURRENT_JOBS → 503 if full).
     job = await job_store.create_job(
         language_hint=language_hint,
