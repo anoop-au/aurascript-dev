@@ -74,6 +74,8 @@ async def analyze_audio(input_path: Path) -> AudioAnalysis:
         "-print_format", "json",
         "-show_streams",
         "-show_format",
+        "-analyzeduration", "100M",
+        "-probesize", "100M",
         str(input_path),
     ]
 
@@ -121,8 +123,18 @@ async def analyze_audio(input_path: Path) -> AudioAnalysis:
     stream = audio_streams[0]
     fmt = probe.get("format", {})
 
-    # Duration: prefer format-level (more reliable for containers).
-    raw_duration = fmt.get("duration") or stream.get("duration") or "0"
+    # Duration: format-level first, then audio stream, then video stream
+    raw_duration = fmt.get("duration") or stream.get("duration")
+
+    if not raw_duration or float(raw_duration or 0) < 1.0:
+        video_streams = [
+            s for s in probe.get("streams", [])
+            if s.get("codec_type") == "video"
+        ]
+        if video_streams:
+            raw_duration = video_streams[0].get("duration") or raw_duration
+
+    raw_duration = raw_duration or "0"
     try:
         duration_seconds = float(raw_duration)
     except ValueError:
@@ -243,6 +255,7 @@ async def chunk_audio(
     args = [
         "ffmpeg",
         "-i", str(input_path),
+        "-vn",                    # Skip video stream (e.g. MP4 inputs)
         "-f", "segment",
         "-segment_time", str(settings.CHUNK_DURATION_SECONDS),
         "-c:a", "libmp3lame",
@@ -328,6 +341,7 @@ async def stream_chunk_audio(
     args = [
         "ffmpeg",
         "-i", str(input_path),
+        "-vn",                             # Skip video stream (e.g. MP4 inputs)
         "-f", "segment",
         "-segment_time", str(settings.CHUNK_DURATION_SECONDS),
         "-segment_list", str(list_file),   # ffmpeg writes chunk names here

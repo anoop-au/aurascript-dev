@@ -105,6 +105,8 @@ class Settings(BaseSettings):
     UPLOAD_DIR: Path = Path("/tmp/aurascript/uploads")
     # Directory where audio chunks are written during processing.
     CHUNKS_DIR: Path = Path("/tmp/aurascript/chunks")
+    # Directory where completed job results are persisted as JSON.
+    RESULTS_DIR: Path = Path("/tmp/aurascript/results")
     # Whitelist of accepted MIME types validated against Content-Type header.
     ALLOWED_AUDIO_MIME_TYPES: list[str] = [
         "audio/mpeg",
@@ -116,8 +118,9 @@ class Settings(BaseSettings):
         "audio/x-m4a",
         "audio/ogg",
         "audio/webm",
-        "video/mp4",      # MP4 video (audio extracted during processing)
-        "video/webm",     # webm audio recorded via MediaRecorder
+        "video/mp4",        # MP4 video (audio extracted during processing)
+        "video/quicktime", # iOS camera roll MP4/MOV alias
+        "video/webm",      # webm audio recorded via MediaRecorder
         "audio/flac",
         "audio/x-flac",   # browser alias for audio/flac
         "audio/aac",

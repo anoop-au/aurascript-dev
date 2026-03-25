@@ -43,6 +43,7 @@ from aurascript.models.schemas import (
 from aurascript.models.events import AgentDecisionEvent
 from aurascript.services import pipeline
 from aurascript.utils.cleanup import cleanup_job_files
+from aurascript.utils.result_store import load_result
 
 import datetime
 
@@ -64,6 +65,7 @@ async def submit_transcription(
     file: UploadFile,
     language_hint: str = Form("auto", max_length=50),
     num_speakers: int = Form(2, ge=1, le=10),
+    translate_to: Optional[str] = Form(None, max_length=50),
     webhook_url: Optional[str] = Form(None),
     api_key: str = Depends(api_key_auth),
     _rate: None = Depends(rate_limiter),
@@ -98,6 +100,7 @@ async def submit_transcription(
         audio_path=audio_path,
         language_hint=language_hint,
         num_speakers=num_speakers,
+        translate_to=translate_to,
         webhook_url=webhook_url,
         webhook_service=webhook_service,
     )
@@ -171,9 +174,19 @@ async def get_job_result(
 ):
     job = await job_store.get_job(job_id)
     if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": f"Job {job_id!r} not found."},
+        # In-memory record evicted (TTL or restart) — try disk fallback.
+        data = load_result(settings.RESULTS_DIR, job_id)
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": f"Job {job_id!r} not found."},
+            )
+        return JobResultResponse(
+            job_id=data["job_id"],
+            status="COMPLETED",
+            transcript=data["transcript"],
+            speaker_map=data["speaker_map"],
+            metadata=data["metadata"],
         )
 
     if job.status == JobStatus.PROCESSING or job.status == JobStatus.PENDING:

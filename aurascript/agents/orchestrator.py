@@ -78,6 +78,7 @@ class OrchestratorInput:
     audio_path: Path
     language_hint: str
     num_speakers: int
+    translate_to: str | None = None
 
 
 @dataclass
@@ -183,6 +184,7 @@ class OrchestratorAgent(BaseAgent):
                     total_chunks=total_chunks,
                     language_hint=input_data.language_hint,
                     num_speakers=input_data.num_speakers,
+                    translate_to=input_data.translate_to,
                 ),
                 semaphore=semaphore,
             )
@@ -246,6 +248,7 @@ class OrchestratorAgent(BaseAgent):
                         total_chunks=total_chunks,
                         language_hint=input_data.language_hint,
                         num_speakers=input_data.num_speakers,
+                        translate_to=input_data.translate_to,
                     ),
                     semaphore=semaphore,
                     is_retry=True,
@@ -405,7 +408,18 @@ class OrchestratorAgent(BaseAgent):
             if list_file.exists():
                 all_file_paths.append(list_file)
 
-            raw_results = await asyncio.gather(*pipeline_tasks, return_exceptions=True)
+            CHUNK_TIMEOUT = 120  # seconds per chunk
+
+            async def _transcribe_with_timeout(task):
+                try:
+                    return await asyncio.wait_for(task, timeout=CHUNK_TIMEOUT)
+                except asyncio.TimeoutError:
+                    return TimeoutError("chunk timed out after 120s")
+
+            raw_results = await asyncio.gather(
+                *[_transcribe_with_timeout(t) for t in pipeline_tasks],
+                return_exceptions=True
+            )
 
             # Safety net for any unexpected top-level exception.
             corrected_chunks: list[CorrectedChunk] = []

@@ -155,6 +155,7 @@ def _build_system_prompt(
     language_hint: str,
     num_speakers: int,
     is_retry: bool,
+    translate_to: str | None = None,
 ) -> str:
     lang_instruction = (
         f"Primary language hint: {language_hint}. "
@@ -166,6 +167,11 @@ def _build_system_prompt(
         language_hint_instruction=lang_instruction,
         num_speakers=num_speakers,
     )
+    if translate_to:
+        prompt += (
+            f"\n\nTranslate the final transcript to {translate_to}. "
+            "Preserve speaker labels and timestamps."
+        )
     if is_retry:
         prompt += _RETRY_PROMPT_SUFFIX
     return prompt
@@ -332,7 +338,7 @@ class TranscriptionAgent(BaseAgent):
         client = self._get_client()
 
         system_prompt = _build_system_prompt(
-            input.language_hint, input.num_speakers, is_retry
+            input.language_hint, input.num_speakers, is_retry, input.translate_to
         )
 
         audio_bytes = input.chunk_path.read_bytes()

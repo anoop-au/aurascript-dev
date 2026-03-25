@@ -45,6 +45,7 @@ class TranscriptionInput:
     total_chunks: int
     language_hint: str
     num_speakers: int
+    translate_to: str | None = None
 
 
 @dataclass

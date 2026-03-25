@@ -22,6 +22,7 @@ from starlette.websockets import WebSocketState
 from aurascript.config import settings
 from aurascript.core.job_store import JobStatus, job_store
 from aurascript.dependencies import connection_manager, event_bus
+from aurascript.utils.result_store import load_result
 
 logger = structlog.get_logger(__name__)
 
@@ -57,14 +58,29 @@ async def transcription_websocket(
     # ── Check job exists ──────────────────────────────────────────────────────
     job = await job_store.get_job(job_id)
     if job is None:
+        # Job evicted from memory — check disk for a completed result.
         await websocket.accept()
-        await websocket.send_json({
-            "event_type": "job.failed",
-            "job_id": job_id,
-            "error_code": "INTERNAL_ERROR",
-            "error_message": f"Job {job_id!r} not found.",
-        })
-        await websocket.close(code=1008)
+        data = load_result(settings.RESULTS_DIR, job_id)
+        if data:
+            import datetime as _dt
+            await websocket.send_json({
+                "event_type": "job.complete",
+                "job_id": job_id,
+                "timestamp": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+                "sequence": 0,
+                "transcript": data["transcript"],
+                "speaker_map": data["speaker_map"],
+                "metadata": data["metadata"],
+            })
+            await websocket.close(code=1000)
+        else:
+            await websocket.send_json({
+                "event_type": "job.failed",
+                "job_id": job_id,
+                "error_code": "INTERNAL_ERROR",
+                "error_message": f"Job {job_id!r} not found.",
+            })
+            await websocket.close(code=1008)
         return
 
     # ── Accept the connection ─────────────────────────────────────────────────
@@ -120,8 +136,11 @@ async def transcription_websocket(
     finally:
         keepalive_task.cancel()
         await connection_manager.disconnect(job_id, websocket)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.close(code=1000)
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close(code=1000)
+        except Exception:
+            pass
         log.info("websocket_closed")
 
 

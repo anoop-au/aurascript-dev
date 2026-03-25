@@ -26,6 +26,7 @@ from aurascript.core.job_store import JobStatus, job_store
 from aurascript.models.events import JobCompleteEvent, JobFailedEvent
 from aurascript.services.event_bus import event_bus
 from aurascript.services.webhook_service import WebhookService
+from aurascript.utils.result_store import save_result
 
 logger = structlog.get_logger(__name__)
 
@@ -35,6 +36,7 @@ async def process_transcription_job(
     audio_path: Path,
     language_hint: str,
     num_speakers: int,
+    translate_to: str | None,
     webhook_url: str | None,
     webhook_service: WebhookService,
 ) -> None:
@@ -67,6 +69,7 @@ async def process_transcription_job(
                 audio_path=audio_path,
                 language_hint=language_hint,
                 num_speakers=num_speakers,
+                translate_to=translate_to,
             )
         )
 
@@ -79,6 +82,14 @@ async def process_transcription_job(
             metadata=result.metadata,
             progress_percent=100.0,
             current_stage="COMPLETED",
+        )
+        # Write result to disk so it survives TTL eviction / container restart.
+        await save_result(
+            settings.RESULTS_DIR,
+            job_id,
+            result.transcript,
+            result.speaker_map,
+            result.metadata,
         )
         log.info("pipeline_completed")
 
