@@ -171,8 +171,10 @@ def _build_system_prompt(
     )
     if translate_to:
         prompt += (
-            f"\n\nTranslate the final transcript to {translate_to}. "
-            "Preserve speaker labels and timestamps."
+            "\n\nOVERRIDE RULE 2: The user has requested translation. "
+            f"Translate ALL spoken content to {translate_to}. "
+            "MANDATORY: Keep every [MM:SS] timestamp and [Speaker X]: label. "
+            "Translate words only. Do NOT merge lines."
         )
     if is_retry:
         prompt += _RETRY_PROMPT_SUFFIX
