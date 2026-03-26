@@ -23,6 +23,13 @@ from fastapi import (
     status,
 )
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+
 from aurascript.config import settings
 from aurascript.core.job_store import JobStatus, job_store
 from aurascript.core.security import APIKeyAuth, RateLimiter
@@ -305,3 +312,54 @@ async def test_webhook(
             else f"Webhook delivery failed. Last status: {status_code}"
         ),
     )
+
+
+# ── POST /translate ────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/translate",
+    summary="Translate a transcript to a target language",
+)
+async def translate_transcript(
+    transcript: str = Form(..., max_length=100_000),
+    translate_to: str = Form("english", max_length=50),
+    _key: str = Depends(api_key_auth),
+) -> dict:
+    """
+    Translate *transcript* to *translate_to* (default: english).
+    Uses the same Gemini model as the transcription pipeline.
+    """
+    if not _GENAI_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "Translation service unavailable (google-genai not installed)."},
+        )
+
+    system_prompt = (
+        f"You are a professional translator. "
+        f"Translate the following transcript to {translate_to}. "
+        "Preserve all [MM:SS] timestamps and [Speaker X]: labels exactly. "
+        "Translate spoken words only. Do not add commentary or explanations."
+    )
+
+    try:
+        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        response = await client.aio.models.generate_content(
+            model=settings.VERTEX_AI_MODEL_TRANSCRIBE,
+            contents=transcript,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.0,
+                max_output_tokens=8192,
+            ),
+        )
+        translation = (response.text or "").strip()
+    except Exception as exc:
+        logger.error("translate_endpoint_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "Translation failed. Please try again."},
+        )
+
+    return {"translation": translation}
