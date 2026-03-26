@@ -108,6 +108,7 @@ class StitcherInput:
     num_speakers: int
     total_duration_seconds: float
     previous_chunk_speakers: dict[str, str] = field(default_factory=dict)
+    translate_to: str | None = None
 
 
 @dataclass

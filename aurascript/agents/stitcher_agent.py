@@ -46,7 +46,7 @@ You are AuraScript's expert diarization and transcript unification engine.
 CONTEXT FROM PREVIOUS CHUNKS:
 {previous_context}
 
-INPUT: A single Manglish audio chunk transcript.
+INPUT: A single audio chunk transcript{translation_note}.
 Chunks marked ⚠️ LOW CONFIDENCE were flagged during quality checks — treat with caution.
 
 YOUR TASKS:
@@ -63,7 +63,7 @@ Rules:
 
 TASK 2: BOUNDARY WORD REPAIR
 Find all [cut-off] markers. If you can reconstruct the word with confidence from
-context, provide the replacement. Otherwise use [inaudible].
+context, provide the replacement{boundary_language_note}. Otherwise use [inaudible].
 
 TASK 3: OUTPUT CLEANUP
 If you see [overlap] tags, separate overlapping speakers into two distinct
@@ -251,10 +251,22 @@ class StitcherAgent(BaseAgent):
         chunk_index = input.corrected_chunks[0].chunk_index
 
         previous_context = _format_previous_context(input.previous_chunk_speakers)
+        translation_note = (
+            f" that has been translated to {input.translate_to}"
+            if input.translate_to
+            else " (Manglish — Malayalam/English mix)"
+        )
+        boundary_language_note = (
+            f" — provide the replacement in {input.translate_to}"
+            if input.translate_to
+            else ""
+        )
         system_prompt = _STITCH_SYSTEM_PROMPT.format(
             previous_context=previous_context,
             chunk_index=chunk_index,
             num_speakers=input.num_speakers,
+            translation_note=translation_note,
+            boundary_language_note=boundary_language_note,
         )
         input_text = _build_stitcher_input_text(input)
 

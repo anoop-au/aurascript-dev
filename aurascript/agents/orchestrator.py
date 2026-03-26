@@ -484,6 +484,7 @@ class OrchestratorAgent(BaseAgent):
                         num_speakers=input.num_speakers,
                         total_duration_seconds=analysis.duration_seconds,
                         previous_chunk_speakers=dict(context_speaker_map),
+                        translate_to=input.translate_to,
                     )
                     stitch_output = await StitcherAgent(
                         self.job_id, self.event_bus, self.settings

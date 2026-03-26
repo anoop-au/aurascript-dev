@@ -79,6 +79,12 @@ async def submit_transcription(
     Returns immediately with a 202 and URLs for WebSocket, polling, and result.
     The actual transcription runs asynchronously in the background.
     """
+    # DEBUG: log all raw form fields to diagnose translate_to not arriving
+    try:
+        _form = await request.form()
+        logger.info("raw_form_fields", fields={k: v for k, v in _form.multi_items() if k != "file"})
+    except Exception:
+        pass
     logger.info("transcribe_request_received", language_hint=language_hint, translate_to=translate_to, num_speakers=num_speakers)
 
     # Create job record (also enforces MAX_CONCURRENT_JOBS → 503 if full).
